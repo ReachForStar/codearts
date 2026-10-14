@@ -4,7 +4,7 @@
 [![magpie plugin](https://img.shields.io/badge/magpie-plugin-8A2BE2)](https://usemagpie.ai/docs/zh/plugins)
 [![OpenCode plugin](https://img.shields.io/badge/OpenCode-plugin-blue)](https://opencode.ai)
 ![no dependencies](https://img.shields.io/badge/dependencies-none-brightgreen)
-![tests](https://img.shields.io/badge/tests-38%20passing-success)
+![tests](https://img.shields.io/badge/tests-44%20passing-success)
 
 [Huawei Cloud CodeArts (华为云码道 代码智能体)](https://www.huaweicloud.com/product/codearts.html)  
 作为 magpie / OpenCode 的 provider 插件：用**华为云 OAuth 授权登录**接入码道的模型  
@@ -64,12 +64,14 @@ magpie plugin add ./index.mjs
     （`usageTotalPackageCredit`），把已用比例显示为一条「total credits」窗口；
     取不到时在用量卡片显示一条错误，不影响对话。
 -   **并发与排队**：码道按账号限制 3 个并发会话，超出的聊天请求返回 HTTP 400
-    `TM.00001041`。插件按账号把在途请求限制为 3 个（超出的排队等待），对该错误
-    每 10 秒重试一次（上限 180 次，约 30 分钟），重试前查询 `api/v1/queue/status`，
-    返回 `queue_full` / `error` 时立即结束重试并交回上游原话；调用方取消请求
-    （`AbortSignal`）时立刻停止等待。同一账号复用固定的 `Session-Id` / `Chat-Id`，
-    避免每个请求新开一个 60–90 秒才释放的上游会话。可用插件选项
-    `maxInflight`、`queueRetryDelayMs`、`queueMaxAttempts` 调整。
+    `TM.00001041`（也可能以 HTTP 200 + SSE 内嵌 `error_code` 返回）。插件按账号把
+    在途请求限制为 3 个（超出的排队等待），对该错误每 10 秒重试一次（上限 180 次，
+    约 30 分钟），重试前查询 `api/v1/queue/status`，返回 `queue_full` / `error` 时
+    立即结束重试；调用方取消请求（`AbortSignal`）时立刻停止等待。额度用尽
+    （`InferHub.4291.200`）不重试。同一账号复用固定的 `Session-Id` / `Chat-Id`，
+    避免每个请求新开一个 60–90 秒才释放的上游会话。可用插件选项 `maxInflight`、
+    `queueRetryDelayMs`、`queueMaxAttempts` 调整。
+-   **模型过滤**：视觉模型（id 以 `-vl` 结尾，大小写不敏感）不进入实时模型列表。
 -   **区域 / 端点**：当前固定华为云 `cn-north-4`（与真实插件一致）。
 -   本插件不内置 MCP / 中间件，仅做模型接入。
 -   依赖：无（签名、PKCE、DPoP 都用运行时内置的 WebCrypto，无需 `jose` 等三方库）。
@@ -109,7 +111,8 @@ Models appear as `codearts/GLM-5.2`, `codearts/glm-5.3-flash`, `codearts/openpan
 - `benefit` (free-quota) models are detected automatically and sent with a signed `maas_type: benefit` header.
 - At most three concurrent sessions per account: extra chat requests queue behind a
   per-account gate and are retried every 10s (up to 180 times) while upstream answers
-  `TM.00001041`, with the queue status endpoint consulted before each retry.
+  `TM.00001041` (as a 400 or embedded in a 200 SSE stream), with the queue status endpoint
+  consulted before each retry. Vision models (`-vl`) are filtered from the live list.
 - Usage is best-effort, read from the credits endpoint.
 - No MCP / gateway middleware — model access only.
 

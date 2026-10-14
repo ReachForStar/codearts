@@ -45,6 +45,8 @@ issue 实测：空闲后单发 1 次成功；并发 6 时 1 成功 5 失败；�
 - `400` + `TM.00001041` 每 10 秒重试，上限 180 次，重试前查
   `api/v1/queue/status`，`queue_full` / `error` 立即结束；
 - `Session-Id` / `Chat-Id` 由登录时生成、随凭据持久化并跨续期保留的 `session_id` 派生；
+- HTTP 200 + SSE 内嵌 `error_code` 形态同样处理：交回响应前读首个事件，命中可重试
+  排队/限流码就重放请求；
 - 等待期间响应 `AbortSignal` 中止。
 
 ## 涉及模块
@@ -56,18 +58,21 @@ issue 实测：空闲后单发 1 次成功；并发 6 时 1 成功 5 失败；�
 
 ## 复发预防
 
-- 单测锁定四条判据：`isQueueErrorResponse` 只认 400 + `TM.00001041`；重试成功与
-  耗尽两条路径的调用次数；终态状态立即结束；闸门峰值等于 3（`index.test.mjs`
-  的 `upstream concurrency & queueing` 分组）。
+- 单测锁定判据：`isQueueErrorResponse` 只认 400 + `TM.00001041`；
+  `isRetryableQueueCode` 认得 `81111` / 独立的 `429` / `TM.00001041` 且**不**认额度码
+  `InferHub.4291.200`；重试成功与耗尽两条路径的调用次数；SSE 内嵌排队错误的检测与
+  重放、普通 200 正文完整透传；终态状态立即结束；闸门峰值等于 3。
 - 稳定会话 id 由 `session and chat ids stay stable for one account` 与
   `sign-in mints a session id and refresh keeps it` 锁定，含凭据轮换与续期场景。
-- 未覆盖的同类通道：HTTP 200 + SSE 内嵌 `error_code` 形态的排队错误
-  （`InferHub.ModelArts.81111.429`）。若线上出现「思考后无输出」，先查这条。
+- HTTP 200 + SSE 内嵌 `error_code` 的排队错误已覆盖，但仅针对流的**首个事件**；
+  流中途出现的限流在设计上交给上游 AI SDK（此时已有内容产出，重放不安全）。若线上
+  出现「思考后无输出」，先查流中途错误与额度码 `InferHub.4291.200`。
 
 ## 存疑
 
 - 会话存活时长（60–90 秒）与队列调度行为来自 issue 报告与参考实现注释，本机无凭据
   未复现。
 - 次要问题：`openpangu-2.0-flash` 在账号有配额时仍返回 `content: null`、0 token
-  （issue 记录）。该模型的可见性由 magpie 的 `providers.json` 决定，不在本仓库，
-  本轮未处理。
+  （issue 记录）。`kimi-k2.6-vl` / `glm-5.2-sft-harmony` 等模型在 magpie 生成的
+  `plugin-providers.json` 里 `url` 为空。两者的可见性由 magpie 的 `providers.json`
+  决定，不在本仓库，本轮未处理。

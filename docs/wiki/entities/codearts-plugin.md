@@ -48,3 +48,6 @@ status: active
   并发闸门、排队重试与状态探测、稳定 `Session-Id` / `Chat-Id`；版本 0.1.1。
   详见 [CodeArts 并发会话上限排查](../queries/codearts-tm00001041-session-cap.md)与
   [排队重试与并发闸门决策](../decisions/codearts-session-queue-retry.md)。
+- 2026-10-14：补齐同一条上限的第二个通道——HTTP 200 + SSE 内嵌 `error_code` 在
+  交回响应前检测并重放请求；视觉模型过滤改为大小写不敏感（小写 `-vl` 此前漏过）；
+  版本 0.1.2。

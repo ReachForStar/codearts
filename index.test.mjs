@@ -559,3 +559,94 @@ test("sign-in mints a session id and refresh keeps it", async () => {
   assert.equal(next.access_key_id, "AK9")
   assert.equal(next.session_id, cred.session_id)
 })
+
+// ---- vision models & SSE-embedded queue errors -----------------------------
+
+/** The shape CodeArts uses for a queue error inside a 200 SSE stream. */
+const sseEvent = (payload) => `data: ${JSON.stringify(payload)}\n\n`
+
+test("parseModelInfo drops vision models whatever the case", () => {
+  const seen = new Set()
+  assert.equal(x.parseModelInfo({ model_id: "kimi-k2.6-vl" }, seen), undefined)
+  assert.equal(x.parseModelInfo({ model_id: "glm-5.2-vl-0731" }, seen), undefined)
+  assert.equal(x.parseModelInfo({ model_id: "GLM-5.2" }, seen).id, "GLM-5.2")
+})
+
+test("isRetryableQueueCode treats an exhausted quota as final", () => {
+  assert.equal(x.isRetryableQueueCode('{"error_code":"TM.00001041"}'), true)
+  assert.equal(x.isRetryableQueueCode('{"error_code":"InferHub.ModelArts.81111.429"}'), true)
+  assert.equal(x.isRetryableQueueCode("429 Too Many Requests"), true)
+  // `4291` is the quota code; its `429` prefix must not be read as a rate limit.
+  assert.equal(x.isRetryableQueueCode('{"error_code":"InferHub.4291.200"}'), false)
+})
+
+test("signedFetch retries a queue error embedded in a 200 SSE stream", async () => {
+  const cred = await makeCred()
+  let chatCalls = 0
+  const fetcher = async (url) => {
+    if (isQueueUrl(url)) return queueStatus("waiting", { queue_position: 1 })
+    chatCalls += 1
+    if (chatCalls === 1) {
+      return new Response(
+        sseEvent({ text: "[DONE]", error_code: "InferHub.ModelArts.81111.429", error_msg: "TPM limit" }),
+        { status: 200, headers: { "content-type": "text/event-stream" } },
+      )
+    }
+    return new Response(sseEvent({ ok: true }), { status: 200, headers: { "content-type": "text/event-stream" } })
+  }
+  const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: fetcher, queueRetryDelayMs: 1 })
+  const loaded = await plugin.auth.loader(async () => makeAuth(cred))
+  const res = await loaded.fetch(x.CHAT_API_BASE, { method: "POST", body: chatBody("GLM-5.2") })
+  assert.equal(res.status, 200)
+  assert.match(await res.text(), /"ok":true/)
+  assert.equal(chatCalls, 2)
+})
+
+test("signedFetch passes a non-retryable SSE error through", async () => {
+  const cred = await makeCred()
+  let chatCalls = 0
+  const fetcher = async (url) => {
+    if (isQueueUrl(url)) return queueStatus("waiting")
+    chatCalls += 1
+    return new Response(
+      sseEvent({ error_code: "InferHub.4291.200", error_msg: "insufficient quota" }),
+      { status: 200, headers: { "content-type": "text/event-stream" } },
+    )
+  }
+  const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: fetcher, queueRetryDelayMs: 1 })
+  const loaded = await plugin.auth.loader(async () => makeAuth(cred))
+  const res = await loaded.fetch(x.CHAT_API_BASE, { method: "POST", body: chatBody("deepseek-v4.1-flash") })
+  assert.equal(res.status, 200)
+  assert.match(await res.text(), /4291/)
+  assert.equal(chatCalls, 1)
+})
+
+test("signedFetch fails when a queue error never clears in the stream", async () => {
+  const cred = await makeCred()
+  let chatCalls = 0
+  const fetcher = async (url) => {
+    if (isQueueUrl(url)) return queueStatus("waiting")
+    chatCalls += 1
+    return new Response(
+      sseEvent({ error_code: "TM.00001041", error_msg: "并发会话数已达上限(3个)" }),
+      { status: 200, headers: { "content-type": "text/event-stream" } },
+    )
+  }
+  const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: fetcher, queueRetryDelayMs: 1, queueMaxAttempts: 1 })
+  const loaded = await plugin.auth.loader(async () => makeAuth(cred))
+  await assert.rejects(
+    loaded.fetch(x.CHAT_API_BASE, { method: "POST", body: chatBody("GLM-5.2") }),
+    /queue wait timed out/,
+  )
+  assert.equal(chatCalls, 2)
+})
+
+test("signedFetch delivers a plain 200 body unchanged", async () => {
+  const cred = await makeCred()
+  const fetcher = async () => new Response("plain body", { status: 200 })
+  const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: fetcher })
+  const loaded = await plugin.auth.loader(async () => makeAuth(cred))
+  const res = await loaded.fetch(x.CHAT_API_BASE, { method: "POST", body: chatBody("GLM-5.2") })
+  assert.equal(res.status, 200)
+  assert.equal(await res.text(), "plain body")
+})
