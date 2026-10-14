@@ -402,3 +402,160 @@ test("startOAuthFlow serves a callback server and a valid login URL", async () =
 
   await flow.close()
 })
+
+// ---- upstream concurrency & queueing ---------------------------------------
+
+/** A `queue/status` answer in the shape CodeArts sends it. */
+const queueStatus = (status, extra = {}) => new Response(JSON.stringify({ status, ...extra }), { status: 200 })
+
+const isQueueUrl = (url) => String(url).startsWith(x.QUEUE_STATUS_URL)
+
+const chatBody = (model) => JSON.stringify({ model, messages: [] })
+
+test("isQueueErrorResponse only accepts 400 with TM.00001041", () => {
+  assert.equal(x.isQueueErrorResponse(400, '{"error_code":"TM.00001041"}'), true)
+  assert.equal(x.isQueueErrorResponse(400, '{"error_code":"TM.00001042"}'), false)
+  assert.equal(x.isQueueErrorResponse(500, "TM.00001041"), false)
+})
+
+test("signedFetch retries TM.00001041 until upstream frees a session", async () => {
+  const cred = await makeCred()
+  const calls = []
+  const fetcher = async (url) => {
+    calls.push(String(url))
+    if (isQueueUrl(url)) return queueStatus("waiting", { queue_position: 2 })
+    if (calls.filter((u) => !isQueueUrl(u)).length === 1) {
+      return new Response(JSON.stringify({
+        error_code: "TM.00001041",
+        error_msg: "并发会话数已达上限(3个)，请关闭部分会话后重试。",
+      }), { status: 400 })
+    }
+    return new Response("ok", { status: 200 })
+  }
+  const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: fetcher, queueRetryDelayMs: 1 })
+  const loaded = await plugin.auth.loader(async () => makeAuth(cred))
+  const res = await loaded.fetch(x.CHAT_API_BASE, { method: "POST", body: chatBody("GLM-5.2") })
+  assert.equal(res.status, 200)
+  assert.equal(await res.text(), "ok")
+  assert.equal(calls.filter((u) => !isQueueUrl(u)).length, 2)
+  assert.ok(calls.some(isQueueUrl), "the status endpoint must be polled while waiting")
+})
+
+test("signedFetch returns the last upstream answer when the queue never clears", async () => {
+  const cred = await makeCred()
+  let chatCalls = 0
+  const fetcher = async (url) => {
+    if (isQueueUrl(url)) return queueStatus("waiting")
+    chatCalls += 1
+    return new Response('{"error_code":"TM.00001041"}', { status: 400 })
+  }
+  const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: fetcher, queueRetryDelayMs: 1, queueMaxAttempts: 2 })
+  const loaded = await plugin.auth.loader(async () => makeAuth(cred))
+  const res = await loaded.fetch(x.CHAT_API_BASE, { method: "POST", body: chatBody("GLM-5.2") })
+  assert.equal(res.status, 400)
+  assert.match(await res.text(), /TM\.00001041/)
+  assert.equal(chatCalls, 3, "one attempt plus queueMaxAttempts retries")
+})
+
+test("signedFetch stops retrying on a terminal queue status", async () => {
+  const cred = await makeCred()
+  let chatCalls = 0
+  const fetcher = async (url) => {
+    if (isQueueUrl(url)) return queueStatus("queue_full", { message: "queue is full" })
+    chatCalls += 1
+    return new Response('{"error_code":"TM.00001041"}', { status: 400 })
+  }
+  const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: fetcher, queueRetryDelayMs: 1 })
+  const loaded = await plugin.auth.loader(async () => makeAuth(cred))
+  const res = await loaded.fetch(x.CHAT_API_BASE, { method: "POST", body: chatBody("GLM-5.2") })
+  assert.equal(res.status, 400)
+  assert.equal(chatCalls, 1)
+})
+
+test("signedFetch waits on a non-TM error when the status endpoint says waiting", async () => {
+  const cred = await makeCred()
+  let chatCalls = 0
+  const fetcher = async (url) => {
+    if (isQueueUrl(url)) return queueStatus("waiting")
+    chatCalls += 1
+    if (chatCalls === 1) return new Response('{"error_code":"InferHub.ModelArts.81111.429"}', { status: 400 })
+    return new Response("ok", { status: 200 })
+  }
+  const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: fetcher, queueRetryDelayMs: 1 })
+  const loaded = await plugin.auth.loader(async () => makeAuth(cred))
+  const res = await loaded.fetch(x.CHAT_API_BASE, { method: "POST", body: chatBody("openpangu-2.0-flash") })
+  assert.equal(res.status, 200)
+  assert.equal(chatCalls, 2)
+})
+
+test("signedFetch gives up as soon as the caller aborts", async () => {
+  const cred = await makeCred()
+  const controller = new AbortController()
+  const fetcher = async (url) => {
+    if (isQueueUrl(url)) return queueStatus("waiting")
+    controller.abort()
+    return new Response('{"error_code":"TM.00001041"}', { status: 400 })
+  }
+  const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: fetcher, queueRetryDelayMs: 60_000 })
+  const loaded = await plugin.auth.loader(async () => makeAuth(cred))
+  await assert.rejects(
+    loaded.fetch(x.CHAT_API_BASE, { method: "POST", body: chatBody("GLM-5.2"), signal: controller.signal }),
+    (error) => error.name === "AbortError",
+  )
+})
+
+test("the account gate never lets more than three requests in flight", async () => {
+  const cred = await makeCred()
+  let inFlight = 0
+  let peak = 0
+  const fetcher = async () => {
+    inFlight += 1
+    peak = Math.max(peak, inFlight)
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    inFlight -= 1
+    return new Response("ok", { status: 200 })
+  }
+  const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: fetcher })
+  const loaded = await plugin.auth.loader(async () => makeAuth(cred))
+  const call = () => loaded.fetch(x.CHAT_API_BASE, { method: "POST", body: chatBody("GLM-5.2") })
+  await Promise.all(Array.from({ length: 8 }, call))
+  assert.equal(peak, x.ACCOUNT_MAX_INFLIGHT)
+})
+
+test("session and chat ids stay stable for one account", async () => {
+  const cred = await makeCred()
+  const headersOf = async (auth) => {
+    let captured = null
+    const fetcher = async (_url, init) => {
+      captured = new Headers(init.headers)
+      return new Response("ok", { status: 200 })
+    }
+    const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: fetcher })
+    const loaded = await plugin.auth.loader(async () => auth)
+    await loaded.fetch(x.CHAT_API_BASE, { method: "POST", body: chatBody("GLM-5.2") })
+    return captured
+  }
+
+  const first = await headersOf(makeAuth(cred))
+  // A loader re-run for the same credential keeps the same session.
+  const again = await headersOf(makeAuth(cred))
+  assert.equal(first.get("session-id"), again.get("session-id"))
+  assert.equal(first.get("chat-id"), again.get("chat-id"))
+  // The AK rotates on refresh; the stored session id does not.
+  const rotated = await headersOf(makeAuth({ ...cred, access_key_id: "AK3" }))
+  assert.equal(first.get("session-id"), rotated.get("session-id"))
+
+  const other = await headersOf(makeAuth({ ...cred, session_id: "b".repeat(32) }))
+  assert.notEqual(first.get("session-id"), other.get("session-id"))
+})
+
+test("sign-in mints a session id and refresh keeps it", async () => {
+  const cred = await makeCred()
+  assert.match(cred.session_id, /^[0-9a-f]{32}$/)
+  const fetcher = async () => new Response(JSON.stringify({
+    credentials: { access_key_id: "AK9", secret_access_key: "SK9", security_token: "ST9", expiration: "2031-01-01T00:00:00Z" },
+  }), { status: 200 })
+  const next = await x.refreshCredential(cred, fetcher)
+  assert.equal(next.access_key_id, "AK9")
+  assert.equal(next.session_id, cred.session_id)
+})

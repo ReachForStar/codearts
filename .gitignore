@@ -28,6 +28,12 @@ desktop.ini
 # Local agent / tooling state
 .opencode/
 
+# Scratch files (AGENTS.md 2.11)
+tmp/
+
+# qmd local search index (generated)
+.qmd/
+
 # Env / secrets
 .env
 .env.*
