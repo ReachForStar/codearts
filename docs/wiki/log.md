@@ -8,3 +8,5 @@
 ## [2026-10-14] fix | 修复 CodeArts TM.00001041 并发会话上限（排队重试、并发闸门、稳定会话 id），新增 entity/decision/query 三页
 
 ## [2026-10-14] fix | 补齐 SSE 内嵌排队错误的检测与重放、视觉模型过滤大小写修正（0.1.2）
+
+## [2026-10-14] chore | 记录 magpie 侧并发与模型配置（accountConcurrency 3、queueLimit 8、rpm off）

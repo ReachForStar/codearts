@@ -75,3 +75,20 @@ status: active
 - 已读字节先回放再转发剩余流，流中途出现的限流不会触发重试（此时已有内容产出）。
 - 真实链路未在本机验证：本仓库无可用华为云凭据，单测用注入 `fetch` 覆盖报文形态；
   需要在真实账号上复测后才能确认线上行为（见 issue #1 的复现脚本）。
+
+## magpie 侧配套配置（2026-10-14）
+
+三层限制叠在一起：magpie 的账号并发/排队/RPM → 插件的账号级闸门（3）→ 上游的
+3 会话上限。上游死限只有 3，magpie 侧更紧的值只会把等待推到插件之外：
+
+- `accountConcurrency: {"signed in": 3}`（`magpie provider account-concurrency
+  codearts "Signed in" 3`）：与上游一致，超出的请求在 magpie 层排队。
+- `queueLimit: 8`（`magpie provider queue codearts 8`）：等待长度，超出才 429。
+- `maxRPM`：已清除（`magpie provider rpm codearts off`）。上游按并发会话计数，
+  不按每分钟请求数。
+- `models`：移除 `kimi-k2.6-vl`（插件已按 `-vl` 过滤）、`openpangu-2.0-flash`
+  （issue #1 记录返回空补全）、`glm-5.2-sft-harmony`（ArkTS 微调，无可用 endpoint）；
+  用 `magpie provider models codearts +<id>` 可加回。
+- provider 级的 `maxConcurrency: 1` 仍写在 `providers.json` 里：没有 CLI 能改它
+  （`magpie provider set` 报 unknown field），且被账号级 `accountConcurrency` 覆盖，
+  实际生效值是 3。
