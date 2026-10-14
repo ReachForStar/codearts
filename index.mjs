@@ -85,6 +85,9 @@ const QUEUE_STATUS_URL = `${SNAP_HOST}/api/v1/queue/status`
 const QUEUE_RETRY_DELAY_MS = 10_000
 const QUEUE_MAX_ATTEMPTS = 180
 const ACCOUNT_MAX_INFLIGHT = 3
+// How much of a 200 body to read before deciding it is not a queue rejection.
+// A queue error is the stream's first event, so this stays tiny.
+const SSE_PEEK_LIMIT = 8 * 1024
 
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
@@ -673,15 +676,32 @@ async function signedFetch(cred, input, init, context) {
         h.set("X-Magpie-Sign-In", "expired")
         return new Response(res.body, { status: res.status, statusText: res.statusText, headers: h })
       }
-      if (res.ok) return res
-      const text = await res.text().catch(() => "")
-      // A non-queue error still probes the status endpoint first: some models
-      // report the cap with another code yet still land in the queue.
-      const probed = await queryQueueStatus(cred, model, queueContext)
-      const queued = isQueueErrorResponse(res.status, text) || probed?.status === "waiting"
-      if (!queued || attempt >= context.queueMaxAttempts) return rebuildResponse(res, text)
-      // `error` / `queue_full` never turn into a success, so stop waiting.
-      if (probed?.status === "error" || probed?.status === "queue_full") return rebuildResponse(res, text)
+      // A 200 can still be a queue rejection: CodeArts sometimes embeds the
+      // error in the SSE stream instead of answering 400.
+      let queued = false
+      let answer = null
+      if (res.ok) {
+        const peeked = await peekSseQueueError(res)
+        if (!peeked.retry) return peeked.response
+        const probed = await queryQueueStatus(cred, model, queueContext)
+        if (probed?.status === "error" || probed?.status === "queue_full") return queueTerminalResponse(probed)
+        queued = true
+      } else {
+        const text = await res.text().catch(() => "")
+        answer = rebuildResponse(res, text)
+        // A non-queue error still probes the status endpoint first: some models
+        // report the cap with another code yet still land in the queue.
+        const probed = await queryQueueStatus(cred, model, queueContext)
+        queued = isQueueErrorResponse(res.status, text) || probed?.status === "waiting"
+        // `error` / `queue_full` never turn into a success, so stop waiting.
+        if (queued && (probed?.status === "error" || probed?.status === "queue_full")) return answer
+      }
+
+      if (!queued || attempt >= context.queueMaxAttempts) {
+        if (answer) return answer
+        const waited = Math.round((context.queueRetryDelayMs * context.queueMaxAttempts) / 60_000)
+        throw new Error(`CodeArts: queue wait timed out after ${waited} minutes`)
+      }
       await delay(context.queueRetryDelayMs, signal)
     }
   } finally {
@@ -782,12 +802,95 @@ function isQueueErrorResponse(status, text) {
   return status === 400 && text.includes("TM.00001041")
 }
 
+/**
+ * Retryable queue/limit signals CodeArts can embed in a 200 SSE stream.
+ * `429` is anchored to a standalone number on purpose: `InferHub.4291.200` is
+ * an exhausted quota (never retryable), and its `429` prefix was mistaken for
+ * the rate-limit code in the reference implementation, which then retried
+ * silently for 30 minutes.
+ */
+function isRetryableQueueCode(text) {
+  if (text.includes("TM.00001041")) return true
+  return /81111|TPM|(^|[^0-9])429([^0-9]|$)|rate.?limit|too.?many.?requests/i.test(text)
+}
+
+/** Headers for a body we hand over unchanged (length/encoding no longer hold). */
+function streamHeaders(headers) {
+  const out = new Headers(headers)
+  out.delete("content-encoding")
+  out.delete("content-length")
+  return out
+}
+
 /** Rebuild a consumed response so the caller still sees the upstream answer. */
 function rebuildResponse(res, text) {
-  const headers = new Headers(res.headers)
-  headers.delete("content-encoding")
-  headers.delete("content-length")
-  return new Response(text, { status: res.status, statusText: res.statusText, headers })
+  return new Response(text, {
+    status: res.status,
+    statusText: res.statusText,
+    headers: streamHeaders(res.headers),
+  })
+}
+
+/**
+ * Peek at a 200 body before it reaches the caller. CodeArts reports the session
+ * cap both as a 400 and as an error event inside a 200 SSE stream; the stream
+ * has to be inspected before it is handed over, or the caller sees a truncated
+ * answer instead of a retry. The bytes read here are replayed into the stream
+ * handed over, so the body still reaches the caller intact.
+ */
+async function peekSseQueueError(res) {
+  if (!res.body) return { retry: false, response: res }
+  const reader = res.body.getReader()
+  const decoder = new TextDecoder()
+  const buffered = []
+  let seen = ""
+  while (!seen.includes("\n\n") && seen.length < SSE_PEEK_LIMIT) {
+    const { value, done } = await reader.read()
+    if (done) break
+    buffered.push(value)
+    seen += decoder.decode(value, { stream: true })
+  }
+  if (seen.includes("error_code") && isRetryableQueueCode(seen)) {
+    // Discard upstream's stream: the caller gets a fresh attempt instead.
+    // Not awaited: Node's reader.cancel can stay pending on a live body.
+    void reader.cancel().catch(() => {})
+    return { retry: true, response: null }
+  }
+  // Replay what was read, then keep forwarding the rest with back pressure.
+  const body = new ReadableStream({
+    async pull(controller) {
+      const next = buffered.shift()
+      if (next !== undefined) {
+        controller.enqueue(next)
+        return
+      }
+      const { value, done } = await reader.read()
+      if (done) {
+        controller.close()
+        return
+      }
+      controller.enqueue(value)
+    },
+    async cancel(reason) {
+      await reader.cancel(reason).catch(() => {})
+    },
+  })
+  return {
+    retry: false,
+    response: new Response(body, {
+      status: res.status,
+      statusText: res.statusText,
+      headers: streamHeaders(res.headers),
+    }),
+  }
+}
+
+/** Answer the caller with a 429 when upstream never frees its queue. */
+function queueTerminalResponse(status) {
+  return new Response(
+    JSON.stringify({ error_code: "TM.00001041", error_msg: firstOf(status?.message, "CodeArts: queue is full") }),
+    { status: 429, headers: { "content-type": "application/json" } },
+  )
 }
 
 /** Is this session queued upstream? `undefined` when the endpoint says nothing. */
@@ -823,7 +926,8 @@ function parseModelInfo(m, seen) {
   if (typeof rawId !== "string" || !rawId) return undefined
   const id = normalizeModelId(rawId)
   // Hide vision models: small context, no tool calls — not agent main models.
-  if (id.includes("-VL-") || id.endsWith("-VL")) return undefined
+  // Case-insensitive: the gateway lists them lowercase (`kimi-k2.6-vl`).
+  if (/-vl(-|$)/i.test(id)) return undefined
   if (seen.has(id)) return undefined
   seen.add(id)
   const rawName = m.model_name
@@ -1146,6 +1250,7 @@ export const _internal = {
   startOAuthCallbackServer, listenOnCallbackPort, startOAuthFlow,
   toBytes, isBenefitModel, rememberBenefitIds, signedFetch, signedGet,
   createConcurrencyGate, delay, abortError, accountSessionIds,
-  isQueueErrorResponse, rebuildResponse, queryQueueStatus,
+  isQueueErrorResponse, isRetryableQueueCode, streamHeaders, rebuildResponse,
+  peekSseQueueError, queueTerminalResponse, queryQueueStatus,
   parseModelInfo, extractArray, fetchRemoteModels, usageFromStatistics,
 }
