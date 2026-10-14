@@ -78,6 +78,14 @@ const LOGIN_POLL_ATTEMPTS = 120
 // Renew this long before the credential expires.
 const REFRESH_LEAD_MS = 30 * 60 * 1000
 
+// Upstream keeps at most 3 live sessions per account; the 4th answer is HTTP
+// 400 `TM.00001041` (并发会话数已达上限). Wait for the queue instead of
+// handing that to the caller, and cap our own in-flight requests first.
+const QUEUE_STATUS_URL = `${SNAP_HOST}/api/v1/queue/status`
+const QUEUE_RETRY_DELAY_MS = 10_000
+const QUEUE_MAX_ATTEMPTS = 180
+const ACCOUNT_MAX_INFLIGHT = 3
+
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
@@ -299,6 +307,8 @@ function credentialFromTokenResponse(token, codeVerifier, keyPair) {
     refresh_token: token?.refresh_token,
     code_verifier: codeVerifier,
     dpop_private_key_jwk: keyPair.privateKeyJwk,
+    // Minted once and kept across refreshes, so one account keeps one session.
+    session_id: randomHex(16),
   }
 }
 
@@ -385,6 +395,8 @@ async function refreshCredential(cred, fetcher) {
   for (const k of ["domain_id", "user_id", "user_name"]) {
     if (cred[k] && !next[k]) next[k] = cred[k]
   }
+  // The session id belongs to the account, not to the token: keep the old one.
+  if (cred.session_id) next.session_id = cred.session_id
   return next
 }
 
@@ -613,7 +625,9 @@ function rememberBenefitIds(ids) {
 
 /**
  * The plugin's per-request fetch: sign the outgoing chat request with the
- * account's temporary credentials, then send it.
+ * account's temporary credentials, then send it. Requests beyond the
+ * account's session budget wait here, and `TM.00001041` answers are retried
+ * until upstream frees a session instead of reaching the caller.
  */
 async function signedFetch(cred, input, init, context) {
   const req = typeof Request !== "undefined" && input instanceof Request ? input : null
@@ -638,19 +652,41 @@ async function signedFetch(cred, input, init, context) {
   headers.set("Session-Id", context.sessionId)
   headers.set("lang", "en")
 
-  const res = await context.fetcher(url, {
+  const signal = init?.signal ?? req?.signal ?? undefined
+  const request = {
     ...init,
     method,
     headers,
     ...(body.length > 0 ? { body } : {}),
-  })
-  // A 401/403 is the sign-in gone; magpie marks the account from here.
-  if (res.status === 401 || res.status === 403) {
-    const h = new Headers(res.headers)
-    h.set("X-Magpie-Sign-In", "expired")
-    return new Response(res.body, { status: res.status, statusText: res.statusText, headers: h })
+    signal,
   }
-  return res
+  const queueContext = { ...context, signal }
+
+  if (signal?.aborted) throw abortError(signal)
+  await context.gate.acquire()
+  try {
+    for (let attempt = 0; ; attempt += 1) {
+      const res = await context.fetcher(url, request)
+      // A 401/403 is the sign-in gone; magpie marks the account from here.
+      if (res.status === 401 || res.status === 403) {
+        const h = new Headers(res.headers)
+        h.set("X-Magpie-Sign-In", "expired")
+        return new Response(res.body, { status: res.status, statusText: res.statusText, headers: h })
+      }
+      if (res.ok) return res
+      const text = await res.text().catch(() => "")
+      // A non-queue error still probes the status endpoint first: some models
+      // report the cap with another code yet still land in the queue.
+      const probed = await queryQueueStatus(cred, model, queueContext)
+      const queued = isQueueErrorResponse(res.status, text) || probed?.status === "waiting"
+      if (!queued || attempt >= context.queueMaxAttempts) return rebuildResponse(res, text)
+      // `error` / `queue_full` never turn into a success, so stop waiting.
+      if (probed?.status === "error" || probed?.status === "queue_full") return rebuildResponse(res, text)
+      await delay(context.queueRetryDelayMs, signal)
+    }
+  } finally {
+    context.gate.release()
+  }
 }
 
 /** A signed GET returning the response text, or undefined on any failure. */
@@ -670,6 +706,111 @@ async function signedGet(url, cred, fetcher, extraUnsignedHeaders) {
     const res = await fetcher(url, { method: "GET", headers, signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) })
     if (!res.ok) return undefined
     return await res.text()
+  } catch {
+    return undefined
+  }
+}
+
+// ---- upstream concurrency & queueing ---------------------------------------
+
+/**
+ * Per-account gate for in-flight requests: a burst queues here instead of
+ * coming back as `TM.00001041`.
+ */
+function createConcurrencyGate(limit) {
+  let active = 0
+  const waiters = []
+  const admit = () => {
+    if (active >= limit || waiters.length === 0) return
+    active += 1
+    waiters.shift()()
+  }
+  return {
+    acquire() {
+      if (active < limit) {
+        active += 1
+        return Promise.resolve()
+      }
+      return new Promise((resolve) => waiters.push(resolve))
+    },
+    release() {
+      active -= 1
+      admit()
+    },
+  }
+}
+
+function abortError(signal) {
+  return signal?.reason instanceof Error ? signal.reason : new Error("CodeArts: request aborted")
+}
+
+/** Sleep, but give up as soon as the caller aborts the request. */
+function delay(ms, signal) {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(abortError(signal))
+      return
+    }
+    const onAbort = () => {
+      clearTimeout(timer)
+      signal?.removeEventListener("abort", onAbort)
+      reject(abortError(signal))
+    }
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort)
+      resolve()
+    }, ms)
+    signal?.addEventListener("abort", onAbort, { once: true })
+  })
+}
+
+/**
+ * Stable per-account ids. A CodeArts session survives 60-90s after its
+ * request and counts against the account's session budget the whole time, so
+ * one account keeps one `Session-Id`/`Chat-Id` instead of opening a new
+ * session per request. The id is minted at sign-in, stored with the
+ * credential and kept across refreshes; older credentials fall back to their
+ * account identifiers.
+ */
+function accountSessionIds(cred) {
+  const seed = firstOf(cred.session_id, cred.user_id, cred.user_name, cred.access_key_id)
+  return { sessionId: seed, chatId: `chat-${seed}` }
+}
+
+/** `400` + `TM.00001041` is transient account capacity, not a bad request. */
+function isQueueErrorResponse(status, text) {
+  return status === 400 && text.includes("TM.00001041")
+}
+
+/** Rebuild a consumed response so the caller still sees the upstream answer. */
+function rebuildResponse(res, text) {
+  const headers = new Headers(res.headers)
+  headers.delete("content-encoding")
+  headers.delete("content-length")
+  return new Response(text, { status: res.status, statusText: res.statusText, headers })
+}
+
+/** Is this session queued upstream? `undefined` when the endpoint says nothing. */
+async function queryQueueStatus(cred, model, context) {
+  const url = `${QUEUE_STATUS_URL}?model=${encodeURIComponent(model)}&task_id=${encodeURIComponent(context.sessionId)}`
+  const signed = await signRequestHuawei(
+    cred.access_key_id, cred.secret_access_key, cred.security_token,
+    "GET", url, new Uint8Array(),
+  )
+  const headers = new Headers()
+  signed.forEach((value, key) => {
+    if (key !== "host") headers.set(key, value)
+  })
+  headers.set("x-snap-traceid", randomHex(16))
+  headers.set("Agent-Type", "INFERHUB_AGENT")
+  headers.set("X-Language", "en")
+  try {
+    const res = await context.fetcher(url, { method: "GET", headers, signal: context.signal })
+    if (!res.ok) return undefined
+    const body = safeJson(await res.text())
+    const status = body?.status
+    if (status !== "waiting" && status !== "working" && status !== "error" && status !== "queue_full") return undefined
+    return { status, queuePosition: num(body.queue_position), message: firstOf(body.message) }
   } catch {
     return undefined
   }
@@ -802,6 +943,18 @@ function usageFromStatistics(raw) {
 
 export const CodeArtsAuthPlugin = async ({ client } = {}, options = {}) => {
   const fetcher = typeof options?.fetch === "function" ? options.fetch : fetch
+  const queueRetryDelayMs = options?.queueRetryDelayMs ?? QUEUE_RETRY_DELAY_MS
+  const queueMaxAttempts = options?.queueMaxAttempts ?? QUEUE_MAX_ATTEMPTS
+  const maxInflight = options?.maxInflight ?? ACCOUNT_MAX_INFLIGHT
+  const gates = new Map()
+  const gateFor = (key) => {
+    let gate = gates.get(key)
+    if (!gate) {
+      gate = createConcurrencyGate(maxInflight)
+      gates.set(key, gate)
+    }
+    return gate
+  }
 
   const configModel = (m) => ({
     name: m.name ?? m.id,
@@ -888,12 +1041,20 @@ export const CodeArtsAuthPlugin = async ({ client } = {}, options = {}) => {
           return refreshing
         }
 
-        const context = { sessionId: randomHex(16), fetcher }
+        // One account = one session id pair, and one gate for its request budget.
+        const accountKey = firstOf(cred.session_id, cred.user_id, cred.user_name, cred.access_key_id)
+        const context = {
+          ...accountSessionIds(cred),
+          fetcher,
+          gate: gateFor(accountKey),
+          queueRetryDelayMs,
+          queueMaxAttempts,
+        }
         return {
           baseURL: CHAT_API_BASE,
           async fetch(input, init = {}) {
             const c = await current()
-            return signedFetch(c, input, init, { ...context, chatId: randomHex(16) })
+            return signedFetch(c, input, init, context)
           },
         }
       },
@@ -973,6 +1134,7 @@ async function persistCredential(client, cred) {
 export const _internal = {
   PROVIDER, NPM, CATALOG, CONTEXT_WINDOWS, BENEFIT_MODEL_FALLBACK,
   CHAT_API_BASE, SNAP_MODEL_BUILTIN_URL, SNAP_STATISTICS_URL, OPENGW_GATEWAY_CONFIG_URL,
+  QUEUE_STATUS_URL, QUEUE_RETRY_DELAY_MS, QUEUE_MAX_ATTEMPTS, ACCOUNT_MAX_INFLIGHT,
   PORTAL_AUTHORIZE_BASE, STS_TOKEN_ENDPOINT, CLIENT_ID, REDIRECT_PATH,
   firstOf, asRecord, safeJson, num, clamp, prettify, normalizeModelId, formatCredit,
   b64url, utf8, sha256Hex, hmacSha256Hex,
@@ -983,5 +1145,7 @@ export const _internal = {
   buildOAuthLoginUrl, buildPortalLoginResultUrl, parseLegacyCredential, pollForCredential,
   startOAuthCallbackServer, listenOnCallbackPort, startOAuthFlow,
   toBytes, isBenefitModel, rememberBenefitIds, signedFetch, signedGet,
+  createConcurrencyGate, delay, abortError, accountSessionIds,
+  isQueueErrorResponse, rebuildResponse, queryQueueStatus,
   parseModelInfo, extractArray, fetchRemoteModels, usageFromStatistics,
 }

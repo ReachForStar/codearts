@@ -97,3 +97,34 @@ SDK-HMAC-SHA256 签名，凭据由 OAuth 换取。因此本插件的 auth 与签
 ├── README.md
 └── DESIGN.md
 ```
+
+## 五、并发会话与排队（issue #1 修复）
+
+码道按账号限制 3 个并发会话：会话在其请求结束后仍存活 60–90 秒，期间计入上限；
+超出的聊天请求返回 HTTP 400 `TM.00001041`（并发会话数已达上限）。
+
+修复前：每次请求用随机 `Chat-Id`、每个 loader 用随机 `Session-Id` 新开会话，
+`signedFetch` 只处理 401/403，`TM.00001041` 原样透传 —— 任何正常调用频率都会
+饱和上限后全部失败。
+
+现在：
+
+1. **账号级并发闸门**：同账号在途请求不超过 3 个，超出的排队等待
+   （`createConcurrencyGate`，每账号一个实例）。
+2. **排队重试**：`400` + `TM.00001041` 不返回给调用方，改为每 10 秒重试同一请求，
+   上限 180 次（约 30 分钟）。请求体在签名前已缓冲为字节，可原样重放。
+3. **状态探测**：重试前查询 `api/v1/queue/status?model=&task_id=<sessionId>`，
+   返回 `queue_full` / `error` 时立即结束重试并交回上游原话；`waiting` / `working`
+   或端点不可达时继续等待。非 `TM.00001041` 的 4xx 也先探测一次，命中 `waiting`
+   即按排队处理（部分模型的并发限流错误码与 GLM 不同）。
+4. **稳定会话 id**：登录时生成一次 `session_id` 存入凭据，`Session-Id` / `Chat-Id`
+   由它派生，续期沿用旧值 —— 同一账号跨请求、跨凭据轮换保持一致（老凭据回退到
+   `user_id` / `user_name` / `access_key_id`）。
+5. **可取消**：等待期间 `AbortSignal` 中止立即停止重试并抛出中止原因。
+
+对齐参考实现 `Ebony-Vinyl/dsh-our-free-model` 的 `vendor/channel-pack/src/llm-adapter.ts`
+（排队端点、10 秒间隔、180 次上限、终态判定）。
+
+未覆盖：码道也会以 HTTP 200 + SSE 内嵌 `error_code`（如
+`InferHub.ModelArts.81111.429`）的形式返回排队错误。插件只改写响应头而透传正文流，
+不解析流内事件，该通道仍由上游 AI SDK 处理。

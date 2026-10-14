@@ -4,7 +4,7 @@
 [![magpie plugin](https://img.shields.io/badge/magpie-plugin-8A2BE2)](https://usemagpie.ai/docs/zh/plugins)
 [![OpenCode plugin](https://img.shields.io/badge/OpenCode-plugin-blue)](https://opencode.ai)
 ![no dependencies](https://img.shields.io/badge/dependencies-none-brightgreen)
-![tests](https://img.shields.io/badge/tests-28%20passing-success)
+![tests](https://img.shields.io/badge/tests-38%20passing-success)
 
 [Huawei Cloud CodeArts (华为云码道 代码智能体)](https://www.huaweicloud.com/product/codearts.html)  
 作为 magpie / OpenCode 的 provider 插件：用**华为云 OAuth 授权登录**接入码道的模型  
@@ -60,9 +60,16 @@ magpie plugin add ./index.mjs
     `maas_type: benefit` 作为**参与签名**的请求头发送，否则后端返回  
     `InferHub.002002009.404 model is not registered`。插件会从 `gateway/config`  
     动态识别这批模型，冷启动时用静态兜底集合。
--   **用量**是尽力而为：读取 `snap-manager/v1/statistics/plugin` 的积分口径  
-    （`usageTotalPackageCredit`），把已用比例显示为一条「total credits」窗口；  
+-   **用量**是尽力而为：读取 `snap-manager/v1/statistics/plugin` 的积分口径
+    （`usageTotalPackageCredit`），把已用比例显示为一条「total credits」窗口；
     取不到时在用量卡片显示一条错误，不影响对话。
+-   **并发与排队**：码道按账号限制 3 个并发会话，超出的聊天请求返回 HTTP 400
+    `TM.00001041`。插件按账号把在途请求限制为 3 个（超出的排队等待），对该错误
+    每 10 秒重试一次（上限 180 次，约 30 分钟），重试前查询 `api/v1/queue/status`，
+    返回 `queue_full` / `error` 时立即结束重试并交回上游原话；调用方取消请求
+    （`AbortSignal`）时立刻停止等待。同一账号复用固定的 `Session-Id` / `Chat-Id`，
+    避免每个请求新开一个 60–90 秒才释放的上游会话。可用插件选项
+    `maxInflight`、`queueRetryDelayMs`、`queueMaxAttempts` 调整。
 -   **区域 / 端点**：当前固定华为云 `cn-north-4`（与真实插件一致）。
 -   本插件不内置 MCP / 中间件，仅做模型接入。
 -   依赖：无（签名、PKCE、DPoP 都用运行时内置的 WebCrypto，无需 `jose` 等三方库）。
@@ -100,6 +107,9 @@ Models appear as `codearts/GLM-5.2`, `codearts/glm-5.3-flash`, `codearts/openpan
 
 - Region/endpoint is fixed to Huawei Cloud `cn-north-4`.
 - `benefit` (free-quota) models are detected automatically and sent with a signed `maas_type: benefit` header.
+- At most three concurrent sessions per account: extra chat requests queue behind a
+  per-account gate and are retried every 10s (up to 180 times) while upstream answers
+  `TM.00001041`, with the queue status endpoint consulted before each retry.
 - Usage is best-effort, read from the credits endpoint.
 - No MCP / gateway middleware — model access only.
 
