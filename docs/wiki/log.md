@@ -10,3 +10,5 @@
 ## [2026-10-14] fix | 补齐 SSE 内嵌排队错误的检测与重放、视觉模型过滤大小写修正（0.1.2）
 
 ## [2026-10-14] chore | 记录 magpie 侧并发与模型配置（accountConcurrency 3、queueLimit 8、rpm off）
+
+## [2026-10-14] chore | 向上游提交 PR #4（仅代码，wiki 不入 PR），在 query 页记录提交状态与权限限制

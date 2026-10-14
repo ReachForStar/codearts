@@ -22,4 +22,4 @@ updated: 2026-10-14
 
 ## 查询沉淀 queries
 
-- [CodeArts TM.00001041 并发会话上限排查](queries/codearts-tm00001041-session-cap.md) — issue #1 的根因、解法与复发预防
+- [CodeArts TM.00001041 并发会话上限排查](queries/codearts-tm00001041-session-cap.md) — issue #1 的根因、解法、复发预防与上游 PR #4 提交状态

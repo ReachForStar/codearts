@@ -68,6 +68,19 @@ issue 实测：空闲后单发 1 次成功；并发 6 时 1 成功 5 失败；�
   流中途出现的限流在设计上交给上游 AI SDK（此时已有内容产出，重放不安全）。若线上
   出现「思考后无输出」，先查流中途错误与额度码 `InferHub.4291.200`。
 
+## 上游提交
+
+- 2026-10-14 提交 PR #4（head `ReachForStar/codearts:main`，base
+  `yuweihao17/codearts:main`），只含代码文件：`.gitignore`、`DESIGN.md`、`README.md`、
+  `index.mjs`、`index.test.mjs`、`package.json`。本仓库的 wiki 沉淀不进入该 PR，只留在
+  本地提交里。
+- PR 正文按 issue #1 所有者的「Suggested fix」逐条对应说明实现，并列出未采纳的建议 4
+  （`openpangu-2.0-flash` 移出 `pickedFrom`）。
+- 同一批代码的分支 `fix/codearts-session-cap` 曾开出 PR #3；head 分支删除后该 PR 自动
+  关闭，不再使用。
+- 当前 gh 账号对上游仓库只有读权限（`viewerPermission: READ`、`push: false`），合并
+  必须由仓库所有者执行。
+
 ## 存疑
 
 - 会话存活时长（60–90 秒）与队列调度行为来自 issue 报告与参考实现注释，本机无凭据
