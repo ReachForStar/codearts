@@ -104,7 +104,18 @@ const CORS_HEADERS = {
 // header, or the backend answers InferHub.002002009.404 "model is not
 // registered". The authoritative list comes from opengw gateway/config at
 // runtime; these are the known defaults so a cold start still works.
-const BENEFIT_MODEL_FALLBACK = ["glm-5.3-flash", "deepseek-v4.1-flash"]
+//
+// The dated ids are measured behaviour, not a guess: `deepseek-v4-flash-0731`
+// answers 200 against the free token pool with the signed benefit header, the
+// bare `deepseek-v4-flash` answers `InferHub.4005.200 unsupported model` with
+// that header, and the dated id answers `InferHub.002002009.404 not registered`
+// without it. The free models are therefore published under their raw dated ids.
+const BENEFIT_MODEL_FALLBACK = [
+  "glm-5.3-flash",
+  "deepseek-v4.1-flash",
+  "deepseek-v4-flash-0731",
+  "deepseek-v4-pro-0813",
+]
 let benefitModelIds = [...BENEFIT_MODEL_FALLBACK]
 
 // Context windows (in tokens), keyed by the exact chat model id. Models
@@ -118,15 +129,18 @@ const CONTEXT_WINDOWS = {
 }
 
 // The models offered before (or instead of) the account's own live list.
+// Ids are exactly what the backend registers: the free models carry their dated
+// ids, because the benefit header only accepts those. `GLM-5` is gone — the
+// endpoint answers `InferHub.002002009.404` for it, so listing it only produced
+// a picker row that could not be called.
 const CATALOG = [
   { id: "GLM-5.2", name: "GLM-5.2" },
   { id: "GLM-5.1", name: "GLM-5.1" },
-  { id: "GLM-5", name: "GLM-5" },
   { id: "glm-5.3-flash", name: "GLM-5.3 Flash" },
   { id: "openpangu-2.0-flash", name: "openPangu 2.0 Flash" },
   { id: "openpangu-2.0-pro", name: "openPangu 2.0 Pro" },
-  { id: "deepseek-v4-flash", name: "DeepSeek V4 Flash" },
-  { id: "deepseek-v4-pro", name: "DeepSeek V4 Pro" },
+  { id: "deepseek-v4-flash-0731", name: "DeepSeek V4 Flash" },
+  { id: "deepseek-v4-pro-0813", name: "DeepSeek V4 Pro" },
   { id: "deepseek-v4.1-flash", name: "DeepSeek V4.1 Flash" },
 ]
 
@@ -165,9 +179,10 @@ function prettify(id) {
     .join(" ")
 }
 
-// stripDateSuffix drops a trailing 4-digit version tag: deepseek-v4-flash-0731
-// -> deepseek-v4-flash. gateway/config lists dated ids but the chat endpoint
-// only accepts the undated id.
+// dropDateSuffix strips a trailing 4-digit version tag: deepseek-v4-flash-0731
+// -> deepseek-v4-flash. Only for the display name and the CONTEXT_WINDOWS
+// lookup. It must not rewrite ids sent to the backend: the dated form is the
+// registered free model and the bare form is a different, paid one.
 function normalizeModelId(id) {
   if (typeof id === "string" && id.length > 5) {
     const suffix = id.slice(-5)
@@ -1015,18 +1030,34 @@ async function queryQueueStatus(cred, model, context) {
 
 // ---- model list & account info ---------------------------------------------
 
+/**
+ * One gateway/builtin entry into a model row. The id handed to magpie is the id
+ * as published, never the date-stripped one: the free models are registered
+ * only under their dated ids, so rewriting them breaks the call.
+ *
+ * Dedupe is by exact id. A dated id and its bare form are two different models
+ * on the backend with opposite billing (`deepseek-v4-flash-0731` draws on the
+ * free token pool, the bare `deepseek-v4-flash` on credits), so collapsing them
+ * would hide one of the two.
+ */
 function parseModelInfo(m, seen) {
   const rawId = m?.model_id
   if (typeof rawId !== "string" || !rawId) return undefined
-  const id = normalizeModelId(rawId)
+  const base = normalizeModelId(rawId)
   // Hide vision models: small context, no tool calls — not agent main models.
   // Case-insensitive: the gateway lists them lowercase (`kimi-k2.6-vl`).
-  if (/-vl(-|$)/i.test(id)) return undefined
-  if (seen.has(id)) return undefined
-  seen.add(id)
+  if (/-vl(-|$)/i.test(base)) return undefined
+  if (seen.has(rawId)) return undefined
+  seen.add(rawId)
   const rawName = m.model_name
-  const name = typeof rawName === "string" && rawName ? normalizeModelId(rawName) : prettify(id)
-  return { id, name, context: CONTEXT_WINDOWS[id] }
+  const name = typeof rawName === "string" && rawName ? normalizeModelId(rawName) : prettify(base)
+  // gateway/config publishes per-model windows; prefer them over the static map.
+  return {
+    id: rawId,
+    name,
+    context: num(m.context_window) || CONTEXT_WINDOWS[base],
+    output: num(m.max_tokens) || undefined,
+  }
 }
 
 function extractArray(text, path) {
@@ -1042,7 +1073,8 @@ function extractArray(text, path) {
 
 /**
  * Fetch the account's live model list from the two signed endpoints and merge
- * them, also recording which gateway ids need the benefit header.
+ * them. Everything opengw gateway/config publishes is billed against the free
+ * daily token pool, so each of its ids is recorded for the benefit header.
  */
 async function fetchRemoteModels(cred, fetcher) {
   const models = []
@@ -1056,12 +1088,8 @@ async function fetchRemoteModels(cred, fetcher) {
       if (typeof item !== "object" || item === null) continue
       const mi = parseModelInfo(item, seen)
       if (!mi) continue
-      // Only undated gateway ids are the benefit ids we actually send; they are
-      // the models billed against the free daily token pool, not the credits.
-      if (item.model_id === mi.id) {
-        mi.benefit = true
-        benefitIds.push(mi.id)
-      }
+      mi.benefit = true
+      benefitIds.push(mi.id)
       models.push(mi)
     }
   }

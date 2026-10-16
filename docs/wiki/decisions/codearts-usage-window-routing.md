@@ -82,6 +82,7 @@ id。magpie 二进制里的上限文案 `is at %.0f%% of a usage window, past it
   子口径当主口径。
 - `free` 标注与 benefit 头共用判定，不会出现「标免费但按积分计费」的不一致；
   若后端日后为 benefit 模型新增其他识别字段，需要同时更新 `isBenefitModel`。
-- 待核验：magpie 对 `models` 的 id 匹配是否包含带日期后缀的原始 id。当前插件下发的
-  模型 id 已去后缀，与 `maas_type: benefit` 实际发送的 id 一致，因此不涉及；
-  若将来改为保留原始 id 下发，需回来核对。
+- 已结案（2026-10-16 实测）：`models` 的 id 匹配不涉及带日期后缀的差异。
+  插件现已按 `gateway/config` 公布的原始 id 下发，与 `maas_type: benefit` 实际发送的
+  id 一致；实测矩阵见
+  [免费模型 id 与计费池归属](../queries/codearts-benefit-model-ids.md)。

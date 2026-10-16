@@ -46,9 +46,10 @@ magpie plugin add ./index.mjs
 
 ## 使用
 
--   模型列表中会出现 `GLM-5.2`、`GLM-5.1`、`GLM-5`、`glm-5.3-flash`、  
-    `openpangu-2.0-flash/pro`、`deepseek-v4-flash/pro`、`deepseek-v4.1-flash` 等；  
-    登录后会以账号真实返回的列表为准。
+-   登录后模型列表以账号真实返回的列表为准，共 9 个：免费额度模型 4 个
+    （`glm-5.3-flash`、`deepseek-v4.1-flash`、`deepseek-v4-flash-0731`、
+    `deepseek-v4-pro-0813`）与积分模型 5 个（`GLM-5.2`、`glm-5.3`、
+    `openpangu-2.0-flash/pro`、`glm-5.2-sft-harmony`）；未登录时用出厂目录。
 -   CLI 里可用 `codearts --model codearts/GLM-5.2` 之类方式指定。
 
 ## 说明与已知限制
@@ -59,10 +60,13 @@ magpie plugin add ./index.mjs
 -   **模型目录**是出厂默认（上下文窗口取自码道模型卡：`GLM-5.2` = 202752、  
     `glm-5.3-flash` / `deepseek-v4-flash` / `deepseek-v4-pro` = 1048576、  
     `deepseek-v4.1-flash` = 1000000）。账号能返回实时列表时会覆盖 `id`/`name`。
--   **benefit（免费额度）模型**：`glm-5.3-flash`、`deepseek-v4.1-flash` 等需要把  
-    `maas_type: benefit` 作为**参与签名**的请求头发送，否则后端返回  
-    `InferHub.002002009.404 model is not registered`。插件会从 `gateway/config`  
-    动态识别这批模型，冷启动时用静态兜底集合。
+    未注册的 `GLM-5` 已从目录移除（接口对它返回 `InferHub.002002009.404`）。
+-   **benefit（免费额度）模型用原始 id 下发**：`gateway/config` 公布的 4 个模型都
+    需要把 `maas_type: benefit` 作为**参与签名**的请求头发送，否则后端返回
+    `InferHub.002002009.404 model is not registered`。插件以接口公布的 id 原样下发，
+    不做去后缀改写：`deepseek-v4-flash-0731` 带 benefit 头返回 200，而它的裸形
+    `deepseek-v4-flash` 带同一头会被拒（`InferHub.4005.200 unsupported model`）。
+    两者在后端是**两个不同模型**，计费口径相反，合并会使其一不可用。
 -   **计费口径分两条池**：付费模型按积分（`usageTotalPackageCredit`，含基础/按需/
     赠送积分包），benefit 模型按**每日 token 免费额度**（`opengw/v1/user/tokens/balance`），
     两者互不相干。免费模型不扣积分属于后端的正常计费隔离，不是漏计。
@@ -114,13 +118,21 @@ the plugin finishes signing in. No API key, no copy-paste.
 ### Use
 
 Models appear as `codearts/GLM-5.2`, `codearts/glm-5.3-flash`, `codearts/openpangu-2.0-flash`,
-`codearts/deepseek-v4.1-flash`, … Verify with `magpie provider test codearts`, or pin one with
-`codearts --model codearts/GLM-5.2`.
+`codearts/deepseek-v4.1-flash`, `codearts/deepseek-v4-flash-0731`, … Verify with
+`magpie provider test codearts`, or pin one with `codearts --model codearts/GLM-5.2`.
+Signed in, the account's own list wins and holds four free-quota models
+(`glm-5.3-flash`, `deepseek-v4.1-flash`, `deepseek-v4-flash-0731`, `deepseek-v4-pro-0813`)
+plus five credit models.
 
 ### Notes
 
 - Region/endpoint is fixed to Huawei Cloud `cn-north-4`.
 - `benefit` (free-quota) models are detected automatically and sent with a signed `maas_type: benefit` header.
+- Free-quota models are published under the ids the gateway lists, date suffix included. The
+  suffix is load-bearing: the dated id answers 200 with the benefit header, while the bare id
+  is rejected with `InferHub.4005.200 unsupported model`, and answers `InferHub.002002009.404`
+  without it. The dated and bare forms are two different models on the backend, so the plugin
+  never folds one into the other.
 - Free-quota models carry magpie's `free: true` model field ("served at no cost to the
   plan's credits"), so the picker marks them as free. The same `isBenefitModel` check that
   adds the signed `maas_type: benefit` header sets it, so the label and the billing can't diverge.

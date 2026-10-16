@@ -40,7 +40,10 @@ status: active
   （用于稳定的 `Session-Id` / `Chat-Id`）；续期有两条通道：`auth.refresh` 钩子，
   以及 loader 内针对忽略该钩子的宿主（OpenCode / 旧 magpie）的单飞兜底。
 - benefit（免费额度）模型必须带参与签名的 `maas_type: benefit` 头，集合由
-  `gateway/config` 动态识别并有静态兜底。
+  `gateway/config` 动态识别并有静态兜底。**该端点公布的 id 原样下发，不做去日期
+  后缀改写**：带后缀的 id 才是后端注册的免费模型形态，裸形是另一个模型（带同一
+  头会被拒为 `InferHub.4005.200 unsupported model`）。实测矩阵、去重口径与失效后果
+  见 [免费模型 id 与计费池归属](../queries/codearts-benefit-model-ids.md)。
 - **只有流式请求被计量**：非流式的 200 回答返回 tokens 却不动 `package_credit_used`。
   `signedFetch` 在签名前把对话体改写为 `stream: true`（请求体参与 payload hash，必须先改再签），
   再用 `parseSseEvents` / `completionFromChunks` 折叠回调用方要求的 JSON；流内无 `choices`
@@ -70,3 +73,7 @@ status: active
   [非流式请求不计费与免费额度口径](../queries/codearts-nonstream-metering.md)。
 - 2026-10-16：免费模型标注 `free: true`，用量窗口只让「总积分」参与路由上限；
   版本 0.1.4。详见 [用量窗口只让总积分参与路由](../decisions/codearts-usage-window-routing.md)。
+- 2026-10-16：补全免费模型集合：`gateway/config` 的 4 个 id 全部按原始形态下发并标
+  `free: true`（此前 2 个被去后缀改写后与付费 id 相撞，既无标注也调不通）；出厂目录
+  移除未注册的 `GLM-5`；版本 0.1.5。详见
+  [免费模型 id 与计费池归属](../queries/codearts-benefit-model-ids.md)。

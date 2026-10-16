@@ -67,8 +67,14 @@ SDK-HMAC-SHA256 签名，凭据由 OAuth 换取。因此本插件的 auth 与签
 5. **模型目录与用量**
    - 目录换成码道真实模型，并带真实上下文窗口（见 README）。
    - 实时列表来自 `opengw gateway/config`（benefit 模型）∪ `snap-access
-     /v1/model/builtin`（常规模型）；对 `-VL` 视觉模型过滤，并去掉末尾 `-NNNN`
-     日期后缀。
+     /v1/model/builtin`（常规模型）；对 `-VL` 视觉模型过滤。
+   - **下发 id 不做去后缀改写**：`gateway/config` 公布的 4 个模型全部要带
+     `maas_type: benefit` 才能调用，而带日期后缀的 id 才是后端注册的形态。
+     实测：`deepseek-v4-flash-0731` 带 benefit 头 200，裸形 `deepseek-v4-flash`
+     带同一头报 `InferHub.4005.200 unsupported model`，不带则报
+     `InferHub.002002009.404`。两者是后端两个不同模型（计费口径相反），
+     按归一化 id 去重会让免费的那个从列表里消失。日期后缀只用于展示名与
+     `CONTEXT_WINDOWS` 查表。
    - `usage` 读 `statistics/plugin` 的积分口径，并读 `opengw/v1/user/tokens/balance`
      的 benefit 每日 token 额度，映射为 magpie 的 `{plan, windows}`。两条池互斥：
      免费模型只扣 `daily_tokens_used`，不动积分。

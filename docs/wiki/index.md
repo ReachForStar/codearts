@@ -26,3 +26,4 @@ updated: 2026-10-16
 
 - [CodeArts TM.00001041 并发会话上限排查](queries/codearts-tm00001041-session-cap.md) — issue #1 的根因、解法、复发预防与上游 PR #4 提交状态
 - [CodeArts 非流式请求不计费与免费额度口径](queries/codearts-nonstream-metering.md) — 网关只对 SSE 流式请求做用量归集；benefit 模型扣每日 token 免费额度而非积分
+- [CodeArts 免费模型 id 与计费池归属](queries/codearts-benefit-model-ids.md) — `gateway/config` 公布的 4 个 id 全部是 benefit；带日期后缀与裸形是两个不同模型，不能合并
