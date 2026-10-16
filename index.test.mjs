@@ -180,16 +180,24 @@ test("usageFromStatistics maps credit metrics to windows with real numbers", () 
       { name: "usageBasicPackageCredit", package_credit_amount: 1000, package_credit_remain: 250, package_credit_used: 750 },
       { name: "usageOnDemandPackageCredit", package_credit_amount: 20000, package_credit_remain: 20000 },
     ],
-  }, { result: { daily_token_limit: 10000000, daily_tokens_used: 2500000 } })
+  }, { result: { daily_token_limit: 10000000, daily_tokens_used: 2500000 } }, ["glm-5.3-flash", "deepseek-v4.1-flash"])
   assert.equal(usage.plan, "企业版")
   assert.equal(usage.signIn, "kept")
   // The package total is listed first, then the buckets, all with display numbers.
   assert.deepEqual(usage.windows, [
     { name: "总积分", used: 75, display: "750 / 1000", amount: 750, limit: 1000, unit: "credits" },
-    { name: "基础积分包", used: 75, display: "750 / 1000", amount: 750, limit: 1000, unit: "credits" },
-    { name: "按需积分包", used: 0, display: "0 / 2.0万", amount: 0, limit: 20000, unit: "credits" },
-    { name: "免费额度", used: 25, display: "250.0万 / 1000.0万", amount: 2500000, limit: 10000000, unit: "tokens" },
+    { name: "基础积分包", used: 75, display: "750 / 1000", amount: 750, limit: 1000, unit: "credits", aside: true },
+    { name: "按需积分包", used: 0, display: "0 / 2.0万", amount: 0, limit: 20000, unit: "credits", aside: true },
+    { name: "免费额度", used: 25, display: "250.0万 / 1000.0万", amount: 2500000, limit: 10000000, unit: "tokens", aside: true, models: ["deepseek-v4.1-flash", "glm-5.3-flash"] },
   ])
+})
+
+test("only the package total window is left out of routing", () => {
+  // magpie reads its per-account cap off the windows, so a bucket other than the
+  // total must never pause an account that still has credits elsewhere.
+  assert.equal("aside" in x.creditWindow("总积分", 1000, 0), false)
+  assert.equal(x.creditWindow("赠送积分包", 1000, 0).aside, true)
+  assert.equal(x.benefitWindow({ daily_token_limit: 10, daily_tokens_used: 10 }).aside, true)
 })
 
 test("usageFromStatistics omits the free-quota window without a benefit pool", () => {
@@ -264,6 +272,16 @@ test("fetchRemoteModels merges both endpoints, filters VL, and normalizes ids", 
   const ids = models.map((m) => m.id)
   assert.deepEqual(ids, ["glm-5.3-flash", "deepseek-v4-flash", "GLM-5.2"])
   assert.ok(seen.every((s) => String(s.auth).startsWith("SDK-HMAC-SHA256")))
+})
+
+test("fetchRemoteModels marks the undated gateway ids as benefit", async () => {
+  const models = await x.fetchRemoteModels(
+    { access_key_id: "AK", secret_access_key: "SK", security_token: "ST" },
+    modelsFetcher([]),
+  )
+  const byId = Object.fromEntries(models.map((m) => [m.id, m]))
+  assert.equal(byId["glm-5.3-flash"].benefit, true)
+  assert.equal("benefit" in byId["GLM-5.2"], false)
 })
 
 test("signedGet returns undefined on a non-2xx response", async () => {
@@ -382,6 +400,18 @@ test("provider.models returns the account's live list", async () => {
   const models = await plugin.provider.models(provider, { auth: makeAuth(cred) })
   assert.deepEqual(Object.keys(models).sort(), ["GLM-5.2", "deepseek-v4-flash", "glm-5.3-flash"])
   assert.equal(models["GLM-5.2"].limit.context, 202752)
+  // The benefit model shows as free; a paid one carries no free marking.
+  assert.equal(models["glm-5.3-flash"].free, true)
+  assert.equal("free" in models["GLM-5.2"], false)
+})
+
+test("config marks the fallback benefit ids free before anyone is signed in", async () => {
+  const plugin = await CodeArtsAuthPlugin({ client: {} }, {})
+  const config = {}
+  await plugin.config(config)
+  const m = config.provider.codearts.models
+  assert.equal(m["glm-5.3-flash"].free, true)
+  assert.equal("free" in m["GLM-5.2"], false)
 })
 
 test("provider.models falls back to the catalog when unsigned", async () => {

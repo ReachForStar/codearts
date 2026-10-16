@@ -59,18 +59,27 @@ Chat Completions 都返回 HTTP 200 与真实 token 用量。
 
 ## 验证
 
-- `node --test`：52 项通过。
+- `node --test`：52 项通过（加入免费标注与路由口径的用例后为 55 项）。
 - 真实联网（走插件 `loader`）：`stream: false` 请求 432 tokens → `Δusage_token_num=432`、
   `Δcredits=0.23`；`stream=true` 请求 463 tokens → `Δ=463`、`Δcredits=0.25`。
 - benefit 模型走折叠链路后：`Δ免费额度=68`/`86`，`Δ积分=0.00`，两条池保持隔离。
 - `glm-5.3-flash` 折叠后 `content=""` 属正常：该模型把 `max_tokens` 预算全部用于推理，
   `reasoning_content` 913 字符完整保留，原始流 delta 计数为 `content:67 / reasoning_content:66`。
 
+## 后续需求：免费标注与路由口径（同日）
+
+用户提出「模型列表中免费的模型显示免费，路由判断按照总积分判断」。实现与依据见
+[用量窗口只让总积分参与路由](../decisions/codearts-usage-window-routing.md)：免费模型
+带 magpie 模型字段 `free: true`，四个积分口径里只有「总积分」窗口参与路由上限，
+其余窗口（含免费额度）标 `aside: true`。
+
 ## 涉及模块
+
+> 免费标注与路由口径见 [CodeArts 用量窗口只让总积分参与路由](../decisions/codearts-usage-window-routing.md)。
 
 - `index.mjs`：`signedFetch`、`needsStreamMetering`、`parseSseEvents`、`completionFromChunks`、
   `finalizeChatAnswer`、`benefitWindow`、`usageFromStatistics`、`auth.usage`
-- `index.test.mjs`：流式计量与折叠的 7 个新用例
+- `index.test.mjs`：流式计量与折叠的 7 个用例
 - `README.md` / `DESIGN.md`：计费口径与流式计量说明
 
 ## 复发预防

@@ -72,6 +72,11 @@ SDK-HMAC-SHA256 签名，凭据由 OAuth 换取。因此本插件的 auth 与签
    - `usage` 读 `statistics/plugin` 的积分口径，并读 `opengw/v1/user/tokens/balance`
      的 benefit 每日 token 额度，映射为 magpie 的 `{plan, windows}`。两条池互斥：
      免费模型只扣 `daily_tokens_used`，不动积分。
+   - 免费模型在列表里带 magpie 专有字段 `free: true`（套餐免费提供、不占额度），
+     与 `maas_type: benefit` 头共用 `isBenefitModel` 这一判定来源，标注与计费不分叉。
+   - 路由判定只看总积分：magpie 的额度上限取自用量窗口，所以下发的窗口里只有
+     「总积分」参与，其余窗口标 `aside: true`（用完不影响账号使用）；「免费额度」
+     窗口再用 `models` 限定为免费模型 id，免费池耗尽不阻断付费模型。
 
 6. **零依赖**
    - 签名与 PKCE/DPoP 全部用运行时内置 WebCrypto（`globalThis.crypto.subtle`）
@@ -89,7 +94,8 @@ SDK-HMAC-SHA256 签名，凭据由 OAuth 换取。因此本插件的 auth 与签
      `usage` 汇报用量。
 3. `README.md` 写安装 / 登录 / 使用 / 已知限制。
 4. `index.test.mjs` 覆盖签名、PKCE/DPoP、凭据往返、远端列表、loader 签名、
-   续期、用量、回调服务器，全程不联网（`node --test`，28 项）。
+   续期、用量、回调服务器、流式计量与折叠、免费标注与路由口径，全程不联网
+   （`node --test`，55 项）。
 5. `registry-entry.json` 提供加入 `magpie` 插件市场的登记项。
 
 ## 四、目录

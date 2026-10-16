@@ -49,6 +49,12 @@ status: active
 - 计费两条互斥的池：付费模型按积分（`usageTotalPackageCredit` 等四个桶），benefit 模型按
   每日 token 免费额度（`opengw/v1/user/tokens/balance`）。`auth.usage` 两个都读，
   面板多一条「免费额度」窗口（`unit: tokens`）。
+- **免费模型在列表里标 `free: true`**（magpie 模型字段：套餐免费提供、不占额度），
+  与 `maas_type: benefit` 头共用 `isBenefitModel` 单一判定，出厂目录与实时列表都覆盖。
+- **路由只看「总积分」窗口**：其余三个积分桶与免费额度窗口都标 `aside: true`
+  （用完不影响账号使用），免费额度窗口再用 `models` 限定为免费模型 id。
+  依据与实测见
+  [用量窗口只让总积分参与路由](../decisions/codearts-usage-window-routing.md)。
 
 ## 重要变更记录
 
@@ -62,3 +68,5 @@ status: active
 - 2026-10-16：修复插件全部对话请求脱离计费的问题（强制流式 + SSE 折叠回 JSON），
   用量面板增加 benefit 每日 token 免费额度窗口；版本 0.1.3。详见
   [非流式请求不计费与免费额度口径](../queries/codearts-nonstream-metering.md)。
+- 2026-10-16：免费模型标注 `free: true`，用量窗口只让「总积分」参与路由上限；
+  版本 0.1.4。详见 [用量窗口只让总积分参与路由](../decisions/codearts-usage-window-routing.md)。

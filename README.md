@@ -4,7 +4,7 @@
 [![magpie plugin](https://img.shields.io/badge/magpie-plugin-8A2BE2)](https://usemagpie.ai/docs/zh/plugins)
 [![OpenCode plugin](https://img.shields.io/badge/OpenCode-plugin-blue)](https://opencode.ai)
 ![no dependencies](https://img.shields.io/badge/dependencies-none-brightgreen)
-![tests](https://img.shields.io/badge/tests-52%20passing-success)
+![tests](https://img.shields.io/badge/tests-55%20passing-success)
 
 [Huawei Cloud CodeArts (华为云码道 代码智能体)](https://www.huaweicloud.com/product/codearts.html)  
 作为 magpie / OpenCode 的 provider 插件：用**华为云 OAuth 授权登录**接入码道的模型  
@@ -22,7 +22,7 @@ Key**：请求要用临时的 AK/SK/security-token 凭据做 *SDK-HMAC-SHA256* �
     和真实 IDE / CLI 的请求一致。
 3.  **静默续期**：`auth.refresh` 在凭据过期前用 `refresh_token`（复用同一把  
     `code_verifier` 与 DPoP 私钥）换新凭据。
-4.  **模型列表 / 用量**：登录后用签名 GET 拉取账号真实模型列表与积分套餐用量。
+4.  **模型列表 / 用量**：登录后用签名 GET 拉取账号真实模型列表与积分套餐用量，免费额度的模型在列表里标为免费。
 
 ## 安装
 
@@ -66,6 +66,12 @@ magpie plugin add ./index.mjs
 -   **计费口径分两条池**：付费模型按积分（`usageTotalPackageCredit`，含基础/按需/
     赠送积分包），benefit 模型按**每日 token 免费额度**（`opengw/v1/user/tokens/balance`），
     两者互不相干。免费模型不扣积分属于后端的正常计费隔离，不是漏计。
+-   **免费模型在列表里标注**：识别为 benefit 的模型会带 `free: true`（magpie 的模型
+    字段，含义是「套餐免费提供，不占额度」），与发送 `maas_type: benefit` 头用同一
+    判定来源，不会出现标注与计费口径不一致。
+-   **路由只看总积分**：magpie 的额度上限判断取自用量窗口，插件只让「总积分」窗口
+    参与（其余窗口标 `aside: true`，含义是「用完也不影响账号使用」）。「免费额度」
+    窗口用 `models` 限定为免费模型，免费池耗尽只影响这些模型，不会把整个账号判为不可用。
 -   **用量**是尽力而为：读取 `snap-manager/v1/statistics/plugin` 的积分口径与
     `opengw/v1/user/tokens/balance` 的免费额度，显示为「总积分」「各积分包」与
     「免费额度」窗口；取不到时在用量卡片显示一条错误，不影响对话。
@@ -115,6 +121,12 @@ Models appear as `codearts/GLM-5.2`, `codearts/glm-5.3-flash`, `codearts/openpan
 
 - Region/endpoint is fixed to Huawei Cloud `cn-north-4`.
 - `benefit` (free-quota) models are detected automatically and sent with a signed `maas_type: benefit` header.
+- Free-quota models carry magpie's `free: true` model field ("served at no cost to the
+  plan's credits"), so the picker marks them as free. The same `isBenefitModel` check that
+  adds the signed `maas_type: benefit` header sets it, so the label and the billing can't diverge.
+- Routing reads only the package-total credit window: every other window is `aside: true`
+  ("using it up doesn't stop the account"), and the free-quota window is scoped to the benefit
+  ids with `models`. Exhausting the free pool leaves the paid models routable.
 - At most three concurrent sessions per account: extra chat requests queue behind a
   per-account gate and are retried every 10s (up to 180 times) while upstream answers
   `TM.00001041` (as a 400 or embedded in a 200 SSE stream), with the queue status endpoint

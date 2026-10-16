@@ -1056,8 +1056,12 @@ async function fetchRemoteModels(cred, fetcher) {
       if (typeof item !== "object" || item === null) continue
       const mi = parseModelInfo(item, seen)
       if (!mi) continue
-      // Only undated gateway ids are the benefit ids we actually send.
-      if (item.model_id === mi.id) benefitIds.push(mi.id)
+      // Only undated gateway ids are the benefit ids we actually send; they are
+      // the models billed against the free daily token pool, not the credits.
+      if (item.model_id === mi.id) {
+        mi.benefit = true
+        benefitIds.push(mi.id)
+      }
       models.push(mi)
     }
   }
@@ -1101,9 +1105,11 @@ function formatCredit(n) {
 /**
  * The benefit (free-quota) daily token allowance as a usage window. Its unit is
  * tokens, not credits: a `maas_type: benefit` chat is billed against this pool
- * and never touches the credit packages.
+ * and never touches the credit packages. `models` scopes it to the benefit ids
+ * so it counts only the models that draw on it, and `aside` keeps it out of
+ * routing: exhausting the free pool leaves the paid models usable.
  */
-function benefitWindow(raw) {
+function benefitWindow(raw, ids = []) {
   const rec = asRecord(asRecord(raw).result ?? raw)
   const limit = num(rec.daily_token_limit)
   if (limit <= 0) return undefined
@@ -1115,11 +1121,34 @@ function benefitWindow(raw) {
     amount: used,
     limit,
     unit: "tokens",
+    aside: true,
+    ...(ids.length ? { models: [...ids].sort() } : {}),
+  }
+}
+
+/**
+ * A credit bucket as a usage window. magpie reads its routing cap off the
+ * windows it is given, so only the package total is allowed to pause the
+ * account: the per-bucket breakdown is the same money seen from another angle,
+ * and a bonus bucket spent on its own would otherwise stop an account that
+ * still has credits elsewhere.
+ */
+function creditWindow(name, limit, remain) {
+  const used = Math.max(0, limit - remain)
+  return {
+    name,
+    used: clamp(limit > 0 ? ((limit - remain) / limit) * 100 : 0),
+    display: `${formatCredit(used)} / ${formatCredit(limit)}`,
+    amount: used,
+    limit,
+    unit: "credits",
+    // Only the package total may pause the account; the rest are breakdowns.
+    ...(name !== CREDIT_METRIC_LABELS[TOTAL_CREDIT_METRIC] ? { aside: true } : {}),
   }
 }
 
 /** Map the account's `statistics/plugin` answer to magpie's usage shape. */
-function usageFromStatistics(raw, benefitRaw) {
+function usageFromStatistics(raw, benefitRaw, benefitIds = benefitModelIds) {
   let data = raw
   if (raw && typeof raw.code === "number") {
     if (raw.code !== 0) return { error: firstOf(raw.message, raw.msg, `CodeArts code ${raw.code}`), windows: [] }
@@ -1138,23 +1167,14 @@ function usageFromStatistics(raw, benefitRaw) {
     const limit = num(rec.package_credit_amount)
     const remain = num(rec.package_credit_remain)
     if (limit <= 0 && remain <= 0) continue // empty bucket, nothing to show
-    const amount = clamp(limit > 0 ? ((limit - remain) / limit) * 100 : 0)
-    const used = Math.max(0, limit - remain)
-    windows.push({
-      name,
-      used: amount,
-      display: `${formatCredit(used)} / ${formatCredit(limit)}`,
-      amount: used,
-      limit,
-      unit: "credits",
-    })
+    windows.push(creditWindow(name, limit, remain))
   }
 
   // Keep the package total on top, then the per-bucket breakdown, then the
   // separate free-quota pool.
   const totalLabel = CREDIT_METRIC_LABELS[TOTAL_CREDIT_METRIC]
   windows.sort((a, b) => (a.name === totalLabel ? -1 : b.name === totalLabel ? 1 : 0))
-  const benefit = benefitWindow(benefitRaw)
+  const benefit = benefitWindow(benefitRaw, benefitIds)
   if (benefit) windows.push(benefit)
 
   if (windows.length > 0) return { plan: plan || undefined, signIn: "kept", windows }
@@ -1182,6 +1202,9 @@ export const CodeArtsAuthPlugin = async ({ client } = {}, options = {}) => {
     name: m.name ?? m.id,
     limit: { context: m.context ?? 0, output: 0 },
     tool_call: true,
+    // magpie's own field: the model is served from the free daily token pool,
+    // not the plan's credits, so its picker row says 免费.
+    ...(isBenefitModel(m.id) ? { free: true } : {}),
   })
 
   const modelOf = (provider, live) => {
@@ -1191,6 +1214,9 @@ export const CodeArtsAuthPlugin = async ({ client } = {}, options = {}) => {
       id: live.id,
       name: live.name || base.name || live.id,
       limit: { context: live.context ?? base.limit?.context ?? 0, output: 0 },
+      // Same source of truth as the signed `maas_type: benefit` header, so a
+      // model never shows as free while being billed as paid, or the reverse.
+      ...(live.benefit === true || isBenefitModel(live.id) ? { free: true } : {}),
     }
   }
 
@@ -1372,7 +1398,7 @@ export const _internal = {
   toBytes, isBenefitModel, rememberBenefitIds, signedFetch, signedGet,
   createConcurrencyGate, delay, abortError, accountSessionIds,
   isQueueErrorResponse, isRetryableQueueCode, streamHeaders, rebuildResponse,
-  needsStreamMetering, parseSseEvents, completionFromChunks, benefitWindow,
+  needsStreamMetering, parseSseEvents, completionFromChunks, benefitWindow, creditWindow,
   peekSseQueueError, queueTerminalResponse, queryQueueStatus,
   parseModelInfo, extractArray, fetchRemoteModels, usageFromStatistics,
 }
