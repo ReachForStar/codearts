@@ -21,7 +21,7 @@ status: active
 | 文件 | 说明 |
 | --- | --- |
 | `index.mjs` | 全部实现：签名（`signRequestHuawei` / `buildCanonicalRequest`）、PKCE 与 DPoP（`generatePkcePair` / `generateDpopKeyPair` / `signDpopJws`）、本地回调服务器（`startOAuthCallbackServer` / `startOAuthFlow`）、凭据续期（`requestToken` / `refreshCredential`）、请求签名与排队（`signedFetch` / `queryQueueStatus` / `createConcurrencyGate`）、模型目录（`fetchRemoteModels`）、用量（`usageFromStatistics`） |
-| `index.test.mjs` | `node --test`，37 项，全部注入 `options.fetch`，不联网 |
+| `index.test.mjs` | `node --test`，60 项，全部注入 `options.fetch`，不联网 |
 | `README.md` | 安装、登录、使用、已知限制 |
 | `DESIGN.md` | 参考实现映射、改造说明、并发与会话设计 |
 | `registry-entry.json` | magpie 插件市场登记项 |
@@ -77,3 +77,7 @@ status: active
   `free: true`（此前 2 个被去后缀改写后与付费 id 相撞，既无标注也调不通）；出厂目录
   移除未注册的 `GLM-5`；版本 0.1.5。详见
   [免费模型 id 与计费池归属](../queries/codearts-benefit-model-ids.md)。
+- 2026-10-16：把上游软失败换算成 magpie 会切换账号的状态码：额度用尽（SSE 内嵌
+  `4291`）→ 429、其他终态 SSE 错误 → 502、凭据过期（`APIG.0602`）→ 就地刷新后重发
+  一次、刷新令牌失效（`STS5.1806`）→ 401 + `X-Magpie-Sign-In: expired`；版本 0.1.6。
+  详见 [软失败不触发故障切换与状态码换算](../queries/codearts-soft-failure-failover.md)。

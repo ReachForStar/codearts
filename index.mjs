@@ -753,16 +753,21 @@ async function signedFetch(cred, input, init, context) {
   const foldToCompletion = needsStreamMetering(parsed)
   if (foldToCompletion) body = utf8(JSON.stringify({ ...parsed, stream: true }))
 
-  const signed = await signRequestHuawei(
-    cred.access_key_id, cred.secret_access_key, cred.security_token,
-    method, url, body, extra,
-  )
-  signed.forEach((value, key) => {
-    if (key !== "host") headers.set(key, value)
-  })
-  headers.set("Chat-Id", context.chatId)
-  headers.set("Session-Id", context.sessionId)
-  headers.set("lang", "en")
+  // Signing is repeated on a credential renewal, so keep it a step of its own.
+  let activeCred = cred
+  const signWith = async (c) => {
+    const signed = await signRequestHuawei(
+      c.access_key_id, c.secret_access_key, c.security_token,
+      method, url, body, extra,
+    )
+    signed.forEach((value, key) => {
+      if (key !== "host") headers.set(key, value)
+    })
+    headers.set("Chat-Id", context.chatId)
+    headers.set("Session-Id", context.sessionId)
+    headers.set("lang", "en")
+  }
+  await signWith(activeCred)
 
   const signal = init?.signal ?? req?.signal ?? undefined
   const request = {
@@ -774,9 +779,14 @@ async function signedFetch(cred, input, init, context) {
   }
   const queueContext = { ...context, signal }
 
+  // A credential already known to be beyond renewal never gets a network call:
+  // every attempt would answer `APIG.0602` and burn a queue slot.
+  if (context.signInDead?.()) return signInExpiredResponse()
+
   if (signal?.aborted) throw abortError(signal)
   await context.gate.acquire()
   try {
+    let renewed = false
     for (let attempt = 0; ; attempt += 1) {
       const res = await context.fetcher(url, request)
       // A 401/403 is the sign-in gone; magpie marks the account from here.
@@ -797,6 +807,19 @@ async function signedFetch(cred, input, init, context) {
         queued = true
       } else {
         const text = await res.text().catch(() => "")
+        // The temporary credential expired between signing and sending. Renew
+        // the sign-in and send the same request again before reporting anything:
+        // a bare 400 is not a shape magpie moves to another account on.
+        if (!renewed && isExpiredCredentialResponse(text) && context.renewCredential) {
+          renewed = true
+          const next = await context.renewCredential()
+          if (next) {
+            activeCred = next
+            await signWith(activeCred)
+            continue
+          }
+          return signInExpiredResponse(text)
+        }
         answer = rebuildResponse(res, text)
         // A non-queue error still probes the status endpoint first: some models
         // report the cap with another code yet still land in the queue.
@@ -923,6 +946,68 @@ function isRetryableQueueCode(text) {
   return /81111|TPM|(^|[^0-9])429([^0-9]|$)|rate.?limit|too.?many.?requests/i.test(text)
 }
 
+/**
+ * The `error_code` of the first error event in an SSE body, `""` when there is
+ * none. CodeArts reports a dead quota, an expired credential and the session cap
+ * alike this way, so the code is the only thing that tells them apart.
+ */
+function sseErrorCode(text) {
+  const m = /"error_code"\s*:\s*"([^"]+)"/.exec(String(text ?? ""))
+  return m ? m[1] : ""
+}
+
+/** `InferHub.4291.x` is an exhausted quota; `8111x` is a per-minute limit. */
+function isQuotaExhaustedCode(code) {
+  return /4291/.test(String(code ?? ""))
+}
+
+/** `APIG.0602` is the temporary credential past its expiry, not a bad request. */
+function isExpiredCredentialResponse(text) {
+  return /APIG\.0602|security token has expired/i.test(String(text ?? ""))
+}
+
+/**
+ * A refresh the server refuses for good (its one-time token is spent) leaves the
+ * account unusable until someone signs in again. Network hiccups must not.
+ */
+function isPermanentRefreshFailure(error) {
+  return /STS5\.1806|invalid refresh token|refresh token has been used/i.test(String(error?.message ?? error))
+}
+
+/** Does this SSE event carry part of an answer (not just a role or a keepalive)? */
+function sseEventHasContent(event) {
+  const choice = Array.isArray(event?.choices) ? event.choices[0] : undefined
+  if (!choice) return false
+  if (choice.finish_reason != null) return true
+  const delta = asRecord(choice.delta)
+  if (typeof delta.content === "string" && delta.content) return true
+  if (typeof delta.reasoning_content === "string" && delta.reasoning_content) return true
+  return Array.isArray(delta.tool_calls) && delta.tool_calls.length > 0
+}
+
+/**
+ * What a peeked 200 body means before it reaches the caller. `undefined` means
+ * "not decided yet, keep reading": CodeArts can open with an empty delta and put
+ * the terminal error in the next event, which is how a caller ends up with a
+ * stream that stops without a `finish_reason`.
+ */
+function classifySseHead(text) {
+  if (!text) return undefined
+  const events = parseSseEvents(text)
+  if (events.some(sseEventHasContent)) return { kind: "content" }
+  const code = sseErrorCode(text)
+  if (code) {
+    // A half-arrived event is not an answer yet: wait for its newline.
+    if (!text.includes("\n\n")) return undefined
+    if (isRetryableQueueCode(text)) return { kind: "retry" }
+    // 429 and 5xx are the shapes magpie fails over to another account on; the
+    // vendor's own body is kept so the agent shows its words.
+    return { kind: "terminal", code, status: isQuotaExhaustedCode(code) ? 429 : 502 }
+  }
+  if (!text.includes("\n\n")) return undefined
+  return { kind: "content" }
+}
+
 /** Headers for a body we hand over unchanged (length/encoding no longer hold). */
 function streamHeaders(headers) {
   const out = new Headers(headers)
@@ -942,10 +1027,11 @@ function rebuildResponse(res, text) {
 
 /**
  * Peek at a 200 body before it reaches the caller. CodeArts reports the session
- * cap both as a 400 and as an error event inside a 200 SSE stream; the stream
- * has to be inspected before it is handed over, or the caller sees a truncated
- * answer instead of a retry. The bytes read here are replayed into the stream
- * handed over, so the body still reaches the caller intact.
+ * cap, a dead quota and an expired credential as error events inside a 200 SSE
+ * stream; a 200 never fails over, so the caller would see a truncated answer
+ * (`Stream ended without finish_reason`) instead of a retry or another account.
+ * The bytes read here are replayed into the stream handed over, so a real answer
+ * still reaches the caller intact.
  */
 async function peekSseQueueError(res) {
   if (!res.body) return { retry: false, response: res }
@@ -953,17 +1039,33 @@ async function peekSseQueueError(res) {
   const decoder = new TextDecoder()
   const buffered = []
   let seen = ""
-  while (!seen.includes("\n\n") && seen.length < SSE_PEEK_LIMIT) {
+  let verdict
+  for (;;) {
+    verdict = classifySseHead(seen)
+    if (verdict || seen.length >= SSE_PEEK_LIMIT) break
     const { value, done } = await reader.read()
-    if (done) break
+    if (done) {
+      verdict = classifySseHead(seen)
+      break
+    }
     buffered.push(value)
     seen += decoder.decode(value, { stream: true })
   }
-  if (seen.includes("error_code") && isRetryableQueueCode(seen)) {
+  if (verdict?.kind === "retry") {
     // Discard upstream's stream: the caller gets a fresh attempt instead.
     // Not awaited: Node's reader.cancel can stay pending on a live body.
     void reader.cancel().catch(() => {})
     return { retry: true, response: null }
+  }
+  if (verdict?.kind === "terminal") {
+    void reader.cancel().catch(() => {})
+    return {
+      retry: false,
+      response: new Response(seen, {
+        status: verdict.status,
+        headers: { "content-type": "text/event-stream" },
+      }),
+    }
   }
   // Replay what was read, then keep forwarding the rest with back pressure.
   const body = new ReadableStream({
@@ -992,6 +1094,14 @@ async function peekSseQueueError(res) {
       headers: streamHeaders(res.headers),
     }),
   }
+}
+
+/** A 401 magpie reads as "this login is gone": mark it and move to the next account. */
+function signInExpiredResponse(body) {
+  return new Response(body ?? JSON.stringify({ error_code: "APIG.0602", error_msg: "CodeArts: the temporary credential expired; sign in again" }), {
+    status: 401,
+    headers: { "content-type": "application/json", "X-Magpie-Sign-In": "expired" },
+  })
 }
 
 /** Answer the caller with a 429 when upstream never frees its queue. */
@@ -1302,8 +1412,14 @@ export const CodeArtsAuthPlugin = async ({ client } = {}, options = {}) => {
         // Kept for hosts that ignore `auth.refresh` (OpenCode / old magpie):
         // refresh in-band when the credential is about to expire.
         let refreshing = null
-        const current = async () => {
-          if (!cred.refresh_token || Date.parse(cred.expires_at || 0) - Date.now() > REFRESH_LEAD_MS) return cred
+        // Set when the vendor refuses the refresh for good: the one-time token is
+        // spent, so only a fresh sign-in brings the account back. Every later
+        // request answers 401 instead of asking the vendor again.
+        let signInDead = false
+        // One renewal at a time; `null` means it failed, and the caller decides
+        // what that is worth (the old credential, or a 401).
+        const renewCredential = () => {
+          if (signInDead || !cred.refresh_token) return null
           if (!refreshing) {
             refreshing = refreshCredential(cred, fetcher)
               .then((next) => {
@@ -1311,10 +1427,17 @@ export const CodeArtsAuthPlugin = async ({ client } = {}, options = {}) => {
                 void persistCredential(client, next)
                 return next
               })
-              .catch(() => cred)
+              .catch((error) => {
+                if (isPermanentRefreshFailure(error)) signInDead = true
+                return null
+              })
               .finally(() => { refreshing = null })
           }
           return refreshing
+        }
+        const current = async () => {
+          if (signInDead || !cred.refresh_token || Date.parse(cred.expires_at || 0) - Date.now() > REFRESH_LEAD_MS) return cred
+          return (await renewCredential()) ?? cred
         }
 
         // One account = one session id pair, and one gate for its request budget.
@@ -1325,6 +1448,8 @@ export const CodeArtsAuthPlugin = async ({ client } = {}, options = {}) => {
           gate: gateFor(accountKey),
           queueRetryDelayMs,
           queueMaxAttempts,
+          renewCredential,
+          signInDead: () => signInDead,
         }
         return {
           baseURL: CHAT_API_BASE,
@@ -1426,6 +1551,8 @@ export const _internal = {
   toBytes, isBenefitModel, rememberBenefitIds, signedFetch, signedGet,
   createConcurrencyGate, delay, abortError, accountSessionIds,
   isQueueErrorResponse, isRetryableQueueCode, streamHeaders, rebuildResponse,
+  sseErrorCode, isQuotaExhaustedCode, isExpiredCredentialResponse,
+  isPermanentRefreshFailure, sseEventHasContent, classifySseHead, signInExpiredResponse,
   needsStreamMetering, parseSseEvents, completionFromChunks, benefitWindow, creditWindow,
   peekSseQueueError, queueTerminalResponse, queryQueueStatus,
   parseModelInfo, extractArray, fetchRemoteModels, usageFromStatistics,

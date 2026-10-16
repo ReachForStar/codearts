@@ -761,7 +761,7 @@ test("signedFetch retries a queue error embedded in a 200 SSE stream", async () 
   assert.equal(chatCalls, 2)
 })
 
-test("signedFetch passes a non-retryable SSE error through", async () => {
+test("signedFetch answers an exhausted quota with a 429 so magpie moves accounts", async () => {
   const cred = await makeCred()
   let chatCalls = 0
   const fetcher = async (url) => {
@@ -775,9 +775,105 @@ test("signedFetch passes a non-retryable SSE error through", async () => {
   const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: fetcher, queueRetryDelayMs: 1 })
   const loaded = await plugin.auth.loader(async () => makeAuth(cred))
   const res = await loaded.fetch(x.CHAT_API_BASE, { method: "POST", body: chatBody("deepseek-v4.1-flash") })
-  assert.equal(res.status, 200)
+  // A 200 would be handed over as an answer and the caller would see the stream
+  // stop without a finish_reason. 429 is the shape magpie fails over on.
+  assert.equal(res.status, 429)
   assert.match(await res.text(), /4291/)
   assert.equal(chatCalls, 1)
+})
+
+test("signedFetch answers a non-quota terminal SSE error with a 502", async () => {
+  const cred = await makeCred()
+  const fetcher = async (url) => {
+    if (isQueueUrl(url)) return queueStatus("waiting")
+    return new Response(
+      sseEvent({ error_code: "InferHub.5001.500", error_msg: "upstream broke off" }),
+      { status: 200, headers: { "content-type": "text/event-stream" } },
+    )
+  }
+  const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: fetcher, queueRetryDelayMs: 1 })
+  const loaded = await plugin.auth.loader(async () => makeAuth(cred))
+  const res = await loaded.fetch(x.CHAT_API_BASE, { method: "POST", body: chatBody("deepseek-v4.1-flash") })
+  assert.equal(res.status, 502)
+  assert.match(await res.text(), /5001/)
+})
+
+test("signedFetch still passes a stream that opens with an empty delta and then answers", async () => {
+  const cred = await makeCred()
+  const fetcher = async (url) => {
+    if (isQueueUrl(url)) return queueStatus("idle")
+    // The error-capable peek must not wait past real content: a role-only delta
+    // is not content, the text that follows it is.
+    const body = [
+      sseEvent({ choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] }),
+      sseEvent({ choices: [{ index: 0, delta: { content: "hi" }, finish_reason: null }] }),
+      sseEvent({ choices: [{ index: 0, delta: {}, finish_reason: "stop" }] }),
+    ].join("\n\n")
+    return new Response(body, { status: 200, headers: { "content-type": "text/event-stream" } })
+  }
+  const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: fetcher, queueRetryDelayMs: 1 })
+  const loaded = await plugin.auth.loader(async () => makeAuth(cred))
+  const res = await loaded.fetch(x.CHAT_API_BASE, { method: "POST", body: chatBody("GLM-5.2") })
+  assert.equal(res.status, 200)
+  const text = await res.text()
+  assert.match(text, /"hi"/)
+  assert.match(text, /finish_reason/)
+})
+
+test("signedFetch renews the credential on APIG.0602 and sends the request again", async () => {
+  const cred = await makeCred()
+  let chatCalls = 0
+  let tokenCalls = 0
+  const fetcher = async (url) => {
+    if (isQueueUrl(url)) return queueStatus("idle")
+    if (String(url).includes("oauth2/tokens")) {
+      tokenCalls += 1
+      return new Response(
+        JSON.stringify({ credentials: { access_key_id: "AK2", secret_access_key: "SK2", security_token: "ST2", expiration: "2030-01-01T00:00:00Z" }, refresh_token: "R2" }),
+        { status: 200 },
+      )
+    }
+    chatCalls += 1
+    if (chatCalls === 1) {
+      return new Response(
+        JSON.stringify({ error_msg: "Bad request: the security token has expired", error_code: "APIG.0602" }),
+        { status: 400, headers: { "content-type": "application/json" } },
+      )
+    }
+    return new Response(sseEvent({ choices: [{ index: 0, delta: { content: "ok" }, finish_reason: "stop" }] }),
+      { status: 200, headers: { "content-type": "text/event-stream" } })
+  }
+  const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: fetcher, queueRetryDelayMs: 1 })
+  const loaded = await plugin.auth.loader(async () => makeAuth(cred))
+  const res = await loaded.fetch(x.CHAT_API_BASE, { method: "POST", body: chatBody("GLM-5.2") })
+  assert.equal(res.status, 200)
+  assert.match(await res.text(), /"ok"/)
+  assert.equal(tokenCalls, 1)
+  assert.equal(chatCalls, 2)
+})
+
+test("signedFetch marks the account when the credential cannot be renewed", async () => {
+  const cred = await makeCred()
+  const fetcher = async (url) => {
+    if (isQueueUrl(url)) return queueStatus("idle")
+    if (String(url).includes("oauth2/tokens")) {
+      return new Response(
+        JSON.stringify({ error_code: "STS5.1806", error_msg: "invalid refresh token: 'the refresh token has been used'" }),
+        { status: 400 },
+      )
+    }
+    return new Response(
+      JSON.stringify({ error_msg: "Bad request: the security token has expired", error_code: "APIG.0602" }),
+      { status: 400, headers: { "content-type": "application/json" } },
+    )
+  }
+  const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: fetcher, queueRetryDelayMs: 1 })
+  const loaded = await plugin.auth.loader(async () => makeAuth(cred))
+  // A bare 400 is "an error another account wouldn't fix", so magpie never
+  // switches. The header is what makes it move on.
+  const res = await loaded.fetch(x.CHAT_API_BASE, { method: "POST", body: chatBody("GLM-5.2") })
+  assert.equal(res.status, 401)
+  assert.equal(res.headers.get("X-Magpie-Sign-In"), "expired")
 })
 
 test("signedFetch fails when a queue error never clears in the stream", async () => {

@@ -83,10 +83,15 @@ magpie plugin add ./index.mjs
     `TM.00001041`（也可能以 HTTP 200 + SSE 内嵌 `error_code` 返回）。插件按账号把
     在途请求限制为 3 个（超出的排队等待），对该错误每 10 秒重试一次（上限 180 次，
     约 30 分钟），重试前查询 `api/v1/queue/status`，返回 `queue_full` / `error` 时
-    立即结束重试；调用方取消请求（`AbortSignal`）时立刻停止等待。额度用尽
-    （`InferHub.4291.200`）不重试。同一账号复用固定的 `Session-Id` / `Chat-Id`，
-    避免每个请求新开一个 60–90 秒才释放的上游会话。可用插件选项 `maxInflight`、
-    `queueRetryDelayMs`、`queueMaxAttempts` 调整。
+    立即结束重试；调用方取消请求（`AbortSignal`）时立刻停止等待。同一账号复用固定的 `Session-Id` / `Chat-Id`，
+    避免每个请求新开一个 60–90 秒才释放的上游会话。可用插件选项 `maxInflight`、`queueRetryDelayMs`、
+    `queueMaxAttempts` 调整。
+-   **故障切换**：magpie 只对非 2xx 响应切换账号，200 里内嵌的错误会被当作答案透传。插件因此把
+    上游的三类软失败换成对应的状态码：额度用尽（SSE 内嵌 `InferHub.4291.x`）回答 429（magpie 会把请求
+    转到下一个账号）；其他终态 SSE 错误回答 502（服务端错误，同样切换）；登录凭据过期
+    （HTTP 400 + `APIG.0602` / `security token has expired`）先就地刷新凭据并重发一次，刷新令牌已被用掉
+    （`STS5.1806`）时回答 401 并带 `X-Magpie-Sign-In: expired`（magpie 标记该账号要求重新登录，请求转下一个
+    账号）。刷新令牌是一次性的：刷新后必须保存新令牌，任何不落盘的诊断调用都会把令牌烧掉。
 -   **模型过滤**：视觉模型（id 以 `-vl` 结尾，大小写不敏感）不进入实时模型列表。
 -   **区域 / 端点**：当前固定华为云 `cn-north-4`（与真实插件一致）。
 -   本插件不内置 MCP / 中间件，仅做模型接入。
@@ -143,6 +148,13 @@ plus five credit models.
   per-account gate and are retried every 10s (up to 180 times) while upstream answers
   `TM.00001041` (as a 400 or embedded in a 200 SSE stream), with the queue status endpoint
   consulted before each retry. Vision models (`-vl`) are filtered from the live list.
+- Failover: magpie only moves a request to another account on a non-2xx answer, so soft
+  failures inside a 200 SSE stream are re-answered with the status code that matches:
+  exhausted quota (`InferHub.4291.x`) becomes 429, any other terminal SSE error becomes
+  502, and an expired credential (400 `APIG.0602`) triggers an in-place credential renewal
+  and one resend — a spent refresh token (`STS5.1806`) answers 401 with
+  `X-Magpie-Sign-In: expired` so magpie marks the account and moves on. Refresh tokens are
+  single-use: a renewal must persist the new token or the account is burned.
 - Only streaming requests are metered: the plugin rewrites chat bodies to
   `stream: true` before signing and folds the SSE stream back into a JSON
   completion for callers that asked for non-streaming.
