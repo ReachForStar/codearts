@@ -20,3 +20,5 @@
 ## [2026-10-16] feat | 免费模型标注 free:true，用量窗口只让总积分参与路由上限（0.1.4）
 
 ## [2026-10-16] decision | 沉淀用量窗口路由口径的 ADR：四方案对比、aside/models 依据与实机双账号核对
+
+## [2026-10-16] decision | 沉淀分支模型 ADR：删除无独有内容的临时分支，改用 main + develop 双分支，规则写入 CONTRIBUTING.md

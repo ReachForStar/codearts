@@ -106,9 +106,13 @@ SDK-HMAC-SHA256 签名，凭据由 OAuth 换取。因此本插件的 auth 与签
 ├── index.mjs
 ├── index.test.mjs
 ├── registry-entry.json
+├── CONTRIBUTING.md          # 分支模型与同步顺序
 ├── README.md
 └── DESIGN.md
 ```
+
+分支流程见 [CONTRIBUTING.md](CONTRIBUTING.md)，决策依据见
+[main 与 develop 双分支模型](docs/wiki/decisions/codearts-branch-model.md)。
 
 ## 五、并发会话与排队（issue #1 修复）
 

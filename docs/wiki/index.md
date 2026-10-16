@@ -20,6 +20,7 @@ updated: 2026-10-16
 
 - [CodeArts 会话排队重试与并发闸门](decisions/codearts-session-queue-retry.md) — 账号级并发闸门 + `TM.00001041` 排队重试 + 稳定会话 id
 - [CodeArts 用量窗口只让总积分参与路由](decisions/codearts-usage-window-routing.md) — 免费模型标 `free: true`；其余窗口 `aside: true`，路由上限只看总积分
+- [CodeArts 仓库采用 main 与 develop 双分支模型](decisions/codearts-branch-model.md) — 唯一远程 fork；任务在 develop 完成后快进合回 main，临时分支用完即删
 
 ## 查询沉淀 queries
 
