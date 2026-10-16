@@ -51,6 +51,10 @@ const SNAP_STATISTICS_URL = `${SNAP_HOST}/snap-manager/v1/statistics/plugin`
 const CREDENTIAL_ENDPOINT = `${SNAP_HOST}/snap-manager/v1/login/ticket`
 // opengw gateway config: the benefit/free-quota model set.
 const OPENGW_GATEWAY_CONFIG_URL = "https://opengw.developer.huaweicloud.com/api/v1/gateway/config"
+// The benefit (free-quota) pool a `maas_type: benefit` chat is billed against.
+// It is a daily token allowance, separate from the credit packages above, so
+// without it a free model's spend is invisible in the usage panel.
+const BENEFIT_BALANCE_URL = "https://opengw.developer.huaweicloud.com/api/v1/user/tokens/balance"
 // OAuth portal (new IAM flow) and the STS token endpoint.
 const PORTAL_AUTHORIZE_BASE = "https://codearts.huaweicloud.com/portal/authorize"
 const PORTAL_LOGIN_BASE = "https://codearts.huaweicloud.com/portal/login"
@@ -616,6 +620,92 @@ async function toBytes(body) {
   return utf8(String(body))
 }
 
+/**
+ * CodeArts meters a chat only when the answer comes back as an SSE stream: a
+ * non-streaming 200 returns tokens yet leaves `usageTotalPackageCredit`
+ * untouched, so its cost never reaches the credits pool. Send every chat
+ * upstream as `stream: true` and fold the stream back into the shape the
+ * caller asked for.
+ */
+function needsStreamMetering(parsed) {
+  return !!parsed && typeof parsed === "object" && typeof parsed.model === "string" && Array.isArray(parsed.messages) && parsed.stream !== true
+}
+
+/** The JSON payloads of an SSE body, in arrival order, `[DONE]` skipped. */
+function parseSseEvents(text) {
+  const events = []
+  for (const line of String(text).split(/\r?\n/)) {
+    const s = line.trim()
+    if (!s.startsWith("data:")) continue
+    const payload = s.slice(5).trim()
+    if (!payload || payload === "[DONE]") continue
+    const parsed = safeJson(payload)
+    if (parsed) events.push(parsed)
+  }
+  return events
+}
+
+/** Fold streamed `choices[].delta` chunks into one OpenAI completion object. */
+function completionFromChunks(events) {
+  const first = events[0] ?? {}
+  const content = []
+  const reasoning = []
+  const toolCalls = []
+  let finish = null
+  let usage = null
+  let model = first.model
+  for (const ev of events) {
+    if (ev.usage) usage = ev.usage
+    if (typeof ev.model === "string" && ev.model) model = ev.model
+    const choice = Array.isArray(ev.choices) ? ev.choices[0] : undefined
+    if (!choice) continue
+    if (choice.finish_reason != null) finish = choice.finish_reason
+    const delta = asRecord(choice.delta)
+    if (typeof delta.content === "string") content.push(delta.content)
+    if (typeof delta.reasoning_content === "string") reasoning.push(delta.reasoning_content)
+    for (const call of Array.isArray(delta.tool_calls) ? delta.tool_calls : []) {
+      const slotIndex = num(call.index)
+      const slot = toolCalls[slotIndex] ??= { id: "", type: "function", function: { name: "", arguments: "" } }
+      if (typeof call.id === "string" && call.id) slot.id = call.id
+      if (typeof call.type === "string" && call.type) slot.type = call.type
+      if (typeof call.function?.name === "string") slot.function.name += call.function.name
+      if (typeof call.function?.arguments === "string") slot.function.arguments += call.function.arguments
+    }
+  }
+  const message = { role: "assistant", content: content.join("") }
+  if (reasoning.length > 0) message.reasoning_content = reasoning.join("")
+  const calls = toolCalls.filter(Boolean)
+  if (calls.length > 0) message.tool_calls = calls
+  return {
+    id: firstOf(first.id) || `chatcmpl-${Math.floor(Date.now() / 1000)}`,
+    object: "chat.completion",
+    created: num(first.created) || Math.floor(Date.now() / 1000),
+    model,
+    choices: [{ index: 0, message, finish_reason: finish ?? "stop" }],
+    ...(usage ? { usage } : {}),
+  }
+}
+
+/**
+ * Answer a caller that asked for JSON with JSON. A stream carrying no choices is
+ * an upstream error (quota, routing), and that payload must reach the caller
+ * byte-for-byte rather than be turned into an empty completion.
+ */
+async function finalizeChatAnswer(res, foldToCompletion) {
+  if (!foldToCompletion) return res
+  const text = await res.text()
+  const events = parseSseEvents(text)
+  const answered = events.some((ev) => Array.isArray(ev.choices) && ev.choices.length > 0)
+  if (!answered) return rebuildResponse(res, text)
+  const headers = streamHeaders(res.headers)
+  headers.set("content-type", "application/json")
+  return new Response(JSON.stringify(completionFromChunks(events)), {
+    status: res.status,
+    statusText: res.statusText,
+    headers,
+  })
+}
+
 /** Is `model` one that needs the signed `maas_type: benefit` header? */
 function isBenefitModel(model) {
   const id = String(model ?? "")
@@ -641,8 +731,12 @@ async function signedFetch(cred, input, init, context) {
   if (init?.body != null) body = await toBytes(init.body)
   else if (req) body = new Uint8Array(await req.clone().arrayBuffer())
   else body = new Uint8Array()
-  const model = typeof init?.body === "string" ? safeJson(init.body)?.model : undefined
+  // The body is part of the signature, so any rewrite happens before signing.
+  const parsed = body.length > 0 ? safeJson(new TextDecoder().decode(body)) : null
+  const model = parsed?.model
   const extra = isBenefitModel(model) ? { maas_type: "benefit" } : undefined
+  const foldToCompletion = needsStreamMetering(parsed)
+  if (foldToCompletion) body = utf8(JSON.stringify({ ...parsed, stream: true }))
 
   const signed = await signRequestHuawei(
     cred.access_key_id, cred.secret_access_key, cred.security_token,
@@ -682,7 +776,7 @@ async function signedFetch(cred, input, init, context) {
       let answer = null
       if (res.ok) {
         const peeked = await peekSseQueueError(res)
-        if (!peeked.retry) return peeked.response
+        if (!peeked.retry) return finalizeChatAnswer(peeked.response, foldToCompletion)
         const probed = await queryQueueStatus(cred, model, queueContext)
         if (probed?.status === "error" || probed?.status === "queue_full") return queueTerminalResponse(probed)
         queued = true
@@ -994,6 +1088,7 @@ const CREDIT_METRIC_LABELS = {
   usageBonusPackageCredit: "赠送积分包",
 }
 const TOTAL_CREDIT_METRIC = "usageTotalPackageCredit"
+const BENEFIT_WINDOW_LABEL = "免费额度"
 
 /** Compact credit counts for the display string (12345 → "1.2万"). */
 function formatCredit(n) {
@@ -1003,8 +1098,28 @@ function formatCredit(n) {
   return String(Math.round(v))
 }
 
+/**
+ * The benefit (free-quota) daily token allowance as a usage window. Its unit is
+ * tokens, not credits: a `maas_type: benefit` chat is billed against this pool
+ * and never touches the credit packages.
+ */
+function benefitWindow(raw) {
+  const rec = asRecord(asRecord(raw).result ?? raw)
+  const limit = num(rec.daily_token_limit)
+  if (limit <= 0) return undefined
+  const used = Math.max(0, Math.min(num(rec.daily_tokens_used), limit))
+  return {
+    name: BENEFIT_WINDOW_LABEL,
+    used: clamp((used / limit) * 100),
+    display: `${formatCredit(used)} / ${formatCredit(limit)}`,
+    amount: used,
+    limit,
+    unit: "tokens",
+  }
+}
+
 /** Map the account's `statistics/plugin` answer to magpie's usage shape. */
-function usageFromStatistics(raw) {
+function usageFromStatistics(raw, benefitRaw) {
   let data = raw
   if (raw && typeof raw.code === "number") {
     if (raw.code !== 0) return { error: firstOf(raw.message, raw.msg, `CodeArts code ${raw.code}`), windows: [] }
@@ -1035,9 +1150,12 @@ function usageFromStatistics(raw) {
     })
   }
 
-  // Keep the package total on top, then the per-bucket breakdown.
+  // Keep the package total on top, then the per-bucket breakdown, then the
+  // separate free-quota pool.
   const totalLabel = CREDIT_METRIC_LABELS[TOTAL_CREDIT_METRIC]
   windows.sort((a, b) => (a.name === totalLabel ? -1 : b.name === totalLabel ? 1 : 0))
+  const benefit = benefitWindow(benefitRaw)
+  if (benefit) windows.push(benefit)
 
   if (windows.length > 0) return { plan: plan || undefined, signIn: "kept", windows }
   return { plan: plan || undefined, windows, error: "该账号无积分额度" }
@@ -1174,7 +1292,10 @@ export const CodeArtsAuthPlugin = async ({ client } = {}, options = {}) => {
             "X-Language": "zh-cn",
           })
           if (text === undefined) return { error: "CodeArts answered an error", windows: [] }
-          return usageFromStatistics(safeJson(text))
+          // The free-quota panel is best-effort: a credit account with no
+          // benefit pool is normal, so its absence must not fail the whole read.
+          const benefitText = await signedGet(BENEFIT_BALANCE_URL, cred, fetcher)
+          return usageFromStatistics(safeJson(text), benefitText === undefined ? undefined : safeJson(benefitText))
         } catch (e) {
           return { error: e?.message ?? String(e), windows: [] }
         }
@@ -1237,7 +1358,7 @@ async function persistCredential(client, cred) {
 // for tests (never a plugin: magpie only calls exported functions)
 export const _internal = {
   PROVIDER, NPM, CATALOG, CONTEXT_WINDOWS, BENEFIT_MODEL_FALLBACK,
-  CHAT_API_BASE, SNAP_MODEL_BUILTIN_URL, SNAP_STATISTICS_URL, OPENGW_GATEWAY_CONFIG_URL,
+  CHAT_API_BASE, SNAP_MODEL_BUILTIN_URL, SNAP_STATISTICS_URL, OPENGW_GATEWAY_CONFIG_URL, BENEFIT_BALANCE_URL,
   QUEUE_STATUS_URL, QUEUE_RETRY_DELAY_MS, QUEUE_MAX_ATTEMPTS, ACCOUNT_MAX_INFLIGHT,
   PORTAL_AUTHORIZE_BASE, STS_TOKEN_ENDPOINT, CLIENT_ID, REDIRECT_PATH,
   firstOf, asRecord, safeJson, num, clamp, prettify, normalizeModelId, formatCredit,
@@ -1251,6 +1372,7 @@ export const _internal = {
   toBytes, isBenefitModel, rememberBenefitIds, signedFetch, signedGet,
   createConcurrencyGate, delay, abortError, accountSessionIds,
   isQueueErrorResponse, isRetryableQueueCode, streamHeaders, rebuildResponse,
+  needsStreamMetering, parseSseEvents, completionFromChunks, benefitWindow,
   peekSseQueueError, queueTerminalResponse, queryQueueStatus,
   parseModelInfo, extractArray, fetchRemoteModels, usageFromStatistics,
 }

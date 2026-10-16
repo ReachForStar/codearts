@@ -12,3 +12,7 @@
 ## [2026-10-14] chore | 记录 magpie 侧并发与模型配置（accountConcurrency 3、queueLimit 8、rpm off）
 
 ## [2026-10-14] chore | 向上游提交 PR #4（仅代码，wiki 不入 PR），在 query 页记录提交状态与权限限制
+
+## [2026-10-16] fix | 修复 CodeArts 非流式请求不计费：签名前强制 stream:true 并折叠 SSE 回 JSON，用量面板补 benefit 每日 token 免费额度（0.1.3）
+
+## [2026-10-16] query | 沉淀非流式不计费的单变量实测证据与两条计费池口径，关联 entity 页与排队重试决策

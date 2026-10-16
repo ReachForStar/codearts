@@ -1,6 +1,6 @@
 ---
 type: index
-updated: 2026-10-14
+updated: 2026-10-16
 ---
 
 # Wiki 索引
@@ -23,3 +23,4 @@ updated: 2026-10-14
 ## 查询沉淀 queries
 
 - [CodeArts TM.00001041 并发会话上限排查](queries/codearts-tm00001041-session-cap.md) — issue #1 的根因、解法、复发预防与上游 PR #4 提交状态
+- [CodeArts 非流式请求不计费与免费额度口径](queries/codearts-nonstream-metering.md) — 网关只对 SSE 流式请求做用量归集；benefit 模型扣每日 token 免费额度而非积分

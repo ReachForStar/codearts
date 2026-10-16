@@ -4,7 +4,7 @@
 [![magpie plugin](https://img.shields.io/badge/magpie-plugin-8A2BE2)](https://usemagpie.ai/docs/zh/plugins)
 [![OpenCode plugin](https://img.shields.io/badge/OpenCode-plugin-blue)](https://opencode.ai)
 ![no dependencies](https://img.shields.io/badge/dependencies-none-brightgreen)
-![tests](https://img.shields.io/badge/tests-44%20passing-success)
+![tests](https://img.shields.io/badge/tests-52%20passing-success)
 
 [Huawei Cloud CodeArts (华为云码道 代码智能体)](https://www.huaweicloud.com/product/codearts.html)  
 作为 magpie / OpenCode 的 provider 插件：用**华为云 OAuth 授权登录**接入码道的模型  
@@ -53,6 +53,9 @@ magpie plugin add ./index.mjs
 
 ## 说明与已知限制
 
+-   **只有流式请求会被计量**：网关对非流式（`stream: false`）的 200 回答返回 token
+    却不记账，积分与免费额度都不动。插件在签名前把对话请求改写为 `stream: true`，
+    收到 SSE 后再折叠回调用方要求的 JSON 形态，宿主无感知。
 -   **模型目录**是出厂默认（上下文窗口取自码道模型卡：`GLM-5.2` = 202752、  
     `glm-5.3-flash` / `deepseek-v4-flash` / `deepseek-v4-pro` = 1048576、  
     `deepseek-v4.1-flash` = 1000000）。账号能返回实时列表时会覆盖 `id`/`name`。
@@ -60,9 +63,12 @@ magpie plugin add ./index.mjs
     `maas_type: benefit` 作为**参与签名**的请求头发送，否则后端返回  
     `InferHub.002002009.404 model is not registered`。插件会从 `gateway/config`  
     动态识别这批模型，冷启动时用静态兜底集合。
--   **用量**是尽力而为：读取 `snap-manager/v1/statistics/plugin` 的积分口径
-    （`usageTotalPackageCredit`），把已用比例显示为一条「total credits」窗口；
-    取不到时在用量卡片显示一条错误，不影响对话。
+-   **计费口径分两条池**：付费模型按积分（`usageTotalPackageCredit`，含基础/按需/
+    赠送积分包），benefit 模型按**每日 token 免费额度**（`opengw/v1/user/tokens/balance`），
+    两者互不相干。免费模型不扣积分属于后端的正常计费隔离，不是漏计。
+-   **用量**是尽力而为：读取 `snap-manager/v1/statistics/plugin` 的积分口径与
+    `opengw/v1/user/tokens/balance` 的免费额度，显示为「总积分」「各积分包」与
+    「免费额度」窗口；取不到时在用量卡片显示一条错误，不影响对话。
 -   **并发与排队**：码道按账号限制 3 个并发会话，超出的聊天请求返回 HTTP 400
     `TM.00001041`（也可能以 HTTP 200 + SSE 内嵌 `error_code` 返回）。插件按账号把
     在途请求限制为 3 个（超出的排队等待），对该错误每 10 秒重试一次（上限 180 次，
@@ -113,7 +119,11 @@ Models appear as `codearts/GLM-5.2`, `codearts/glm-5.3-flash`, `codearts/openpan
   per-account gate and are retried every 10s (up to 180 times) while upstream answers
   `TM.00001041` (as a 400 or embedded in a 200 SSE stream), with the queue status endpoint
   consulted before each retry. Vision models (`-vl`) are filtered from the live list.
-- Usage is best-effort, read from the credits endpoint.
+- Only streaming requests are metered: the plugin rewrites chat bodies to
+  `stream: true` before signing and folds the SSE stream back into a JSON
+  completion for callers that asked for non-streaming.
+- Usage is best-effort, read from the credits endpoint plus the free-quota
+  (`benefit`) daily token balance.
 - No MCP / gateway middleware — model access only.
 
 ## License

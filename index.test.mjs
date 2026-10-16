@@ -180,7 +180,7 @@ test("usageFromStatistics maps credit metrics to windows with real numbers", () 
       { name: "usageBasicPackageCredit", package_credit_amount: 1000, package_credit_remain: 250, package_credit_used: 750 },
       { name: "usageOnDemandPackageCredit", package_credit_amount: 20000, package_credit_remain: 20000 },
     ],
-  })
+  }, { result: { daily_token_limit: 10000000, daily_tokens_used: 2500000 } })
   assert.equal(usage.plan, "企业版")
   assert.equal(usage.signIn, "kept")
   // The package total is listed first, then the buckets, all with display numbers.
@@ -188,7 +188,26 @@ test("usageFromStatistics maps credit metrics to windows with real numbers", () 
     { name: "总积分", used: 75, display: "750 / 1000", amount: 750, limit: 1000, unit: "credits" },
     { name: "基础积分包", used: 75, display: "750 / 1000", amount: 750, limit: 1000, unit: "credits" },
     { name: "按需积分包", used: 0, display: "0 / 2.0万", amount: 0, limit: 20000, unit: "credits" },
+    { name: "免费额度", used: 25, display: "250.0万 / 1000.0万", amount: 2500000, limit: 10000000, unit: "tokens" },
   ])
+})
+
+test("usageFromStatistics omits the free-quota window without a benefit pool", () => {
+  const stats = {
+    metrics: [{ name: "usageTotalPackageCredit", package_credit_amount: 1000, package_credit_remain: 250, package_credit_used: 750 }],
+  }
+  assert.equal(x.usageFromStatistics(stats).windows.length, 1)
+  // A zero daily limit means the account has no benefit pool at all.
+  const noPool = { result: { daily_token_limit: 0, daily_tokens_used: 0 } }
+  assert.equal(x.usageFromStatistics(stats, noPool).windows.length, 1)
+})
+
+test("usageFromStatistics clamps a free-quota reading the endpoint over-reports", () => {
+  const w = x.benefitWindow({ result: { daily_token_limit: 100, daily_tokens_used: 400 } })
+  assert.deepEqual(
+    { used: w.used, amount: w.amount, unit: w.unit },
+    { used: 100, amount: 100, unit: "tokens" },
+  )
 })
 
 test("usageFromStatistics reports no credit plan when every bucket is empty", () => {
@@ -307,8 +326,9 @@ test("loader signs each chat request with SDK-HMAC-SHA256", async () => {
   assert.ok(headers.get("chat-id"))
   assert.ok(headers.get("session-id"))
   assert.equal(headers.has("maas_type"), false)
-  // The signed body must be forwarded verbatim.
-  assert.equal(new TextDecoder().decode(seen[0].init.body), JSON.stringify({ model: "GLM-5.2", messages: [] }))
+  // The signed body is what goes on the wire; only `stream` is added so the
+  // gateway meters the request at all.
+  assert.equal(new TextDecoder().decode(seen[0].init.body), JSON.stringify({ model: "GLM-5.2", messages: [], stream: true }))
 })
 
 test("loader adds a signed maas_type header for benefit models", async () => {
@@ -558,6 +578,85 @@ test("sign-in mints a session id and refresh keeps it", async () => {
   const next = await x.refreshCredential(cred, fetcher)
   assert.equal(next.access_key_id, "AK9")
   assert.equal(next.session_id, cred.session_id)
+})
+
+// ---- streaming metering ----------------------------------------------------
+
+test("needsStreamMetering only rewrites a chat body the caller asked as JSON", () => {
+  assert.equal(x.needsStreamMetering({ model: "GLM-5.2", messages: [] }), true)
+  // Already streaming: upstream meters it, leave the caller's stream alone.
+  assert.equal(x.needsStreamMetering({ model: "GLM-5.2", messages: [], stream: true }), false)
+  assert.equal(x.needsStreamMetering({ model: "GLM-5.2" }), false)
+  assert.equal(x.needsStreamMetering({ messages: [] }), false)
+  assert.equal(x.needsStreamMetering(null), false)
+})
+
+test("completionFromChunks folds deltas, tool-call fragments, and usage", () => {
+  const events = [
+    { id: "c1", created: 111, model: "GLM-5.2", choices: [{ index: 0, delta: { role: "assistant", content: "he" } }] },
+    { model: "GLM-5.2", choices: [{ index: 0, delta: { content: "llo", reasoning_content: "think", tool_calls: [{ index: 0, id: "call1", function: { name: "read", arguments: '{"a"' } }] } }] },
+    { model: "GLM-5.2", choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { arguments: ':1}' } }] }, finish_reason: "tool_calls" }] },
+    { model: "GLM-5.2", choices: [], usage: { prompt_tokens: 2, completion_tokens: 3, total_tokens: 5 } },
+  ]
+  const done = x.completionFromChunks(events)
+  assert.equal(done.id, "c1")
+  assert.equal(done.object, "chat.completion")
+  assert.equal(done.created, 111)
+  assert.equal(done.model, "GLM-5.2")
+  assert.deepEqual(done.usage, { prompt_tokens: 2, completion_tokens: 3, total_tokens: 5 })
+  const msg = done.choices[0].message
+  assert.equal(msg.content, "hello")
+  assert.equal(msg.reasoning_content, "think")
+  assert.equal(done.choices[0].finish_reason, "tool_calls")
+  assert.deepEqual(msg.tool_calls, [{ id: "call1", type: "function", function: { name: "read", arguments: '{"a":1}' } }])
+})
+
+test("a non-streaming caller gets JSON back from the metered stream", async () => {
+  const cred = await makeCred()
+  const seen = []
+  const fetcher = async (url, init) => {
+    seen.push(init)
+    return new Response(
+      [
+        sseEvent({ id: "c1", created: 5, model: "GLM-5.2", choices: [{ index: 0, delta: { role: "assistant", content: "hi" } }] }),
+        sseEvent({ model: "GLM-5.2", choices: [{ index: 0, delta: {}, finish_reason: "stop" }] }),
+        sseEvent({ model: "GLM-5.2", choices: [], usage: { prompt_tokens: 7, completion_tokens: 2, total_tokens: 9 } }),
+        "data: [DONE]\n\n",
+      ].join(""),
+      { status: 200, headers: { "content-type": "text/event-stream" } },
+    )
+  }
+  const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: fetcher })
+  const loaded = await plugin.auth.loader(async () => makeAuth(cred))
+  const res = await loaded.fetch(x.CHAT_API_BASE, { method: "POST", body: chatBody("GLM-5.2") })
+  assert.equal(res.status, 200)
+  assert.match(res.headers.get("content-type"), /application\/json/)
+  const done = JSON.parse(await res.text())
+  assert.equal(done.choices[0].message.content, "hi")
+  assert.equal(done.usage.total_tokens, 9)
+  assert.equal(JSON.parse(new TextDecoder().decode(seen[0].body)).stream, true)
+})
+
+test("a caller that asked for stream: true keeps the SSE stream untouched", async () => {
+  const cred = await makeCred()
+  const raw = sseEvent({ model: "GLM-5.2", choices: [{ index: 0, delta: { content: "tok" } }] })
+  const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: async () => new Response(raw, { status: 200, headers: { "content-type": "text/event-stream" } }) })
+  const loaded = await plugin.auth.loader(async () => makeAuth(cred))
+  const res = await loaded.fetch(x.CHAT_API_BASE, { method: "POST", body: JSON.stringify({ model: "GLM-5.2", messages: [], stream: true }) })
+  assert.equal(await res.text(), raw)
+})
+
+test("an error carried by the metered stream is passed through, not folded", async () => {
+  const cred = await makeCred()
+  const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: async () => new Response(sseEvent({ error_code: "InferHub.4291.200", error_msg: "insufficient quota" }), { status: 200, headers: { "content-type": "text/event-stream" } }) })
+  const loaded = await plugin.auth.loader(async () => makeAuth(cred))
+  const res = await loaded.fetch(x.CHAT_API_BASE, { method: "POST", body: chatBody("GLM-5.2") })
+  assert.match(await res.text(), /4291/)
+})
+
+test("parseSseEvents tolerates CRLF framing and junk lines", () => {
+  const events = x.parseSseEvents('data: {"a":1}\r\n\r\ncomment\r\n:\r\ndata: {"b":2}\r\n\r\ndata: [DONE]\r\n\r\n')
+  assert.deepEqual(events, [{ a: 1 }, { b: 2 }])
 })
 
 // ---- vision models & SSE-embedded queue errors -----------------------------

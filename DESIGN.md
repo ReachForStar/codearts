@@ -49,6 +49,10 @@ SDK-HMAC-SHA256 签名，凭据由 OAuth 换取。因此本插件的 auth 与签
      用 `signRequestHuawei` 给请求签名。
    - benefit 模型附带**参与签名**的 `maas_type: benefit` 头；非 sign 的 `Chat-Id` /
      `Session-Id` / `lang` 头在签名后追加。
+   - 网关只对 SSE 流式回答做用量归集，非流式的 200 返回 token 却不扣分（实测：
+     `stream: false` 后 `usageTotalPackageCredit.package_credit_used` 为 0，
+     `stream: true` 精确入账）。因此签名前把对话请求体改写为 `stream: true`，
+     再把流折叠回调用方要求的 JSON；错误型流原样透传，不伪装成空回答。
 
 3. **凭据与续期**
    - 完整凭据（AK/SK/ST/`expires_at` + `refresh_token` + `code_verifier` +
@@ -65,7 +69,9 @@ SDK-HMAC-SHA256 签名，凭据由 OAuth 换取。因此本插件的 auth 与签
    - 实时列表来自 `opengw gateway/config`（benefit 模型）∪ `snap-access
      /v1/model/builtin`（常规模型）；对 `-VL` 视觉模型过滤，并去掉末尾 `-NNNN`
      日期后缀。
-   - `usage` 读 `statistics/plugin` 的积分口径，映射为 magpie 的 `{plan, windows}`。
+   - `usage` 读 `statistics/plugin` 的积分口径，并读 `opengw/v1/user/tokens/balance`
+     的 benefit 每日 token 额度，映射为 magpie 的 `{plan, windows}`。两条池互斥：
+     免费模型只扣 `daily_tokens_used`，不动积分。
 
 6. **零依赖**
    - 签名与 PKCE/DPoP 全部用运行时内置 WebCrypto（`globalThis.crypto.subtle`）

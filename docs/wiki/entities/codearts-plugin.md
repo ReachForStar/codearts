@@ -3,7 +3,7 @@ title: CodeArts provider 插件（opencode-codearts-auth）
 type: entity
 tags: [插件, magpie, opencode, oauth, 码道, 华为云]
 created: 2026-10-14
-updated: 2026-10-14
+updated: 2026-10-16
 sources: []
 status: active
 ---
@@ -41,6 +41,14 @@ status: active
   以及 loader 内针对忽略该钩子的宿主（OpenCode / 旧 magpie）的单飞兜底。
 - benefit（免费额度）模型必须带参与签名的 `maas_type: benefit` 头，集合由
   `gateway/config` 动态识别并有静态兜底。
+- **只有流式请求被计量**：非流式的 200 回答返回 tokens 却不动 `package_credit_used`。
+  `signedFetch` 在签名前把对话体改写为 `stream: true`（请求体参与 payload hash，必须先改再签），
+  再用 `parseSseEvents` / `completionFromChunks` 折叠回调用方要求的 JSON；流内无 `choices`
+  时判为上游错误，原样透传。详见
+  [非流式请求不计费](../queries/codearts-nonstream-metering.md)。
+- 计费两条互斥的池：付费模型按积分（`usageTotalPackageCredit` 等四个桶），benefit 模型按
+  每日 token 免费额度（`opengw/v1/user/tokens/balance`）。`auth.usage` 两个都读，
+  面板多一条「免费额度」窗口（`unit: tokens`）。
 
 ## 重要变更记录
 
@@ -51,3 +59,6 @@ status: active
 - 2026-10-14：补齐同一条上限的第二个通道——HTTP 200 + SSE 内嵌 `error_code` 在
   交回响应前检测并重放请求；视觉模型过滤改为大小写不敏感（小写 `-vl` 此前漏过）；
   版本 0.1.2。
+- 2026-10-16：修复插件全部对话请求脱离计费的问题（强制流式 + SSE 折叠回 JSON），
+  用量面板增加 benefit 每日 token 免费额度窗口；版本 0.1.3。详见
+  [非流式请求不计费与免费额度口径](../queries/codearts-nonstream-metering.md)。
