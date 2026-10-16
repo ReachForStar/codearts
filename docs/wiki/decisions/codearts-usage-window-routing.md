@@ -75,7 +75,7 @@ id。magpie 二进制里的上限文案 `is at %.0f%% of a usage window, past it
 `free=true`，其余 7 个为 `free=false`；`magpie provider test codearts glm-5.3-flash` 与
 `GLM-5.2` 均 ✓ chat，标注与计费头未出现不一致。
 
-## 涉及文件
+## 后果（影响与后续）
 
 - 用量面板仍显示四个窗口，用户可见信息不减少；只有「总积分」影响账号是否被暂停。
 - 新增用量窗口默认必须显式决定路由参与方式（不写 `aside` 即参与），避免误把
