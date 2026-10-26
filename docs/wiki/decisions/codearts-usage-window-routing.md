@@ -1,9 +1,9 @@
 ---
 title: CodeArts 用量窗口只让总积分参与路由
 type: decision
-tags: [CodeArts, 用量, 路由, magpie, aside, free]
+tags: [CodeArts, 用量, 路由, magpie, aside, 免费额度]
 created: 2026-10-16
-updated: 2026-10-16
+updated: 2026-10-26
 sources: []
 status: active
 ---
@@ -86,3 +86,15 @@ id。magpie 二进制里的上限文案 `is at %.0f%% of a usage window, past it
   插件现已按 `gateway/config` 公布的原始 id 下发，与 `maas_type: benefit` 实际发送的
   id 一致；实测矩阵见
   [免费模型 id 与计费池归属](../queries/codearts-benefit-model-ids.md)。
+
+## 后续修订（2026-10-26）
+
+免费额度体系被上游下线，本决策中与免费池相关的三处实现随之移除：
+
+- 「免费额度」窗口（`benefitWindow`）不再下发，因为 `user/tokens/balance` 返回
+  `4000 invalid channel, group not found`，且账号已无免费池。
+- 模型的 `free: true` 标注与 `maas_type: benefit` 头一并删除：`gateway/config`
+  已失效，`benefit` 头一律被拒（`InferHub.4004.200`）。
+- 决策核心不变：仍然只有「总积分」不写 `aside`，其余三个积分桶照旧 `aside: true`。
+
+现状与实测见 [免费额度体系下线与计费口径迁移](../queries/codearts-benefit-retired.md)。

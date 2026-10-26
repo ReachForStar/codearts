@@ -49,12 +49,6 @@ const SNAP_HOST = "https://snap-access.cn-north-4.myhuaweicloud.com"
 const SNAP_MODEL_BUILTIN_URL = `${SNAP_HOST}/v1/model/builtin`
 const SNAP_STATISTICS_URL = `${SNAP_HOST}/snap-manager/v1/statistics/plugin`
 const CREDENTIAL_ENDPOINT = `${SNAP_HOST}/snap-manager/v1/login/ticket`
-// opengw gateway config: the benefit/free-quota model set.
-const OPENGW_GATEWAY_CONFIG_URL = "https://opengw.developer.huaweicloud.com/api/v1/gateway/config"
-// The benefit (free-quota) pool a `maas_type: benefit` chat is billed against.
-// It is a daily token allowance, separate from the credit packages above, so
-// without it a free model's spend is invisible in the usage panel.
-const BENEFIT_BALANCE_URL = "https://opengw.developer.huaweicloud.com/api/v1/user/tokens/balance"
 // OAuth portal (new IAM flow) and the STS token endpoint.
 const PORTAL_AUTHORIZE_BASE = "https://codearts.huaweicloud.com/portal/authorize"
 const PORTAL_LOGIN_BASE = "https://codearts.huaweicloud.com/portal/login"
@@ -100,48 +94,34 @@ const CORS_HEADERS = {
   "Access-Control-Max-Age": "86400",
 }
 
-// Benefits (free-quota) models require `maas_type: benefit` as a *signed*
-// header, or the backend answers InferHub.002002009.404 "model is not
-// registered". The authoritative list comes from opengw gateway/config at
-// runtime; these are the known defaults so a cold start still works.
-//
-// The dated ids are measured behaviour, not a guess: `deepseek-v4-flash-0731`
-// answers 200 against the free token pool with the signed benefit header, the
-// bare `deepseek-v4-flash` answers `InferHub.4005.200 unsupported model` with
-// that header, and the dated id answers `InferHub.002002009.404 not registered`
-// without it. The free models are therefore published under their raw dated ids.
-const BENEFIT_MODEL_FALLBACK = [
-  "glm-5.3-flash",
-  "deepseek-v4.1-flash",
-  "deepseek-v4-flash-0731",
-  "deepseek-v4-pro-0813",
-]
-let benefitModelIds = [...BENEFIT_MODEL_FALLBACK]
+// Every model the account lists is billed against the credit packages. The
+// free-quota (`maas_type: benefit`) pool and its `gateway/config` feed were
+// withdrawn upstream on 2026-10-26: the feed now answers `4000 invalid channel`
+// and the old benefit ids are either unregistered or answer `benefit not found`.
+// Nothing here is hardcoded per model; ids, names and prices all come from
+// `${SNAP_MODEL_BUILTIN_URL}`.
 
-// Context windows (in tokens), keyed by the exact chat model id. Models
-// without an entry leave the window to the backend's default.
+// Context windows (in tokens), keyed by the date-stripped model id. The builtin
+// endpoint publishes no window, so a model without an entry leaves it to the
+// backend's default. Values come from the vendor model cards.
 const CONTEXT_WINDOWS = {
   "GLM-5.2": 202752,
-  "glm-5.3-flash": 1048576,
-  "deepseek-v4-flash": 1048576,
-  "deepseek-v4-pro": 1048576,
   "deepseek-v4.1-flash": 1000000,
 }
 
-// The models offered before (or instead of) the account's own live list.
-// Ids are exactly what the backend registers: the free models carry their dated
-// ids, because the benefit header only accepts those. `GLM-5` is gone — the
-// endpoint answers `InferHub.002002009.404` for it, so listing it only produced
-// a picker row that could not be called.
+// The models offered before (or instead of) the account's own live list. Ids and
+// names mirror `${SNAP_MODEL_BUILTIN_URL}` exactly, dated ids included: the
+// backend registers `deepseek-v4.1-flash-1017` and `deepseek-v4.1-flash` as two
+// models, so the picker must show both.
 const CATALOG = [
   { id: "GLM-5.2", name: "GLM-5.2" },
-  { id: "GLM-5.1", name: "GLM-5.1" },
-  { id: "glm-5.3-flash", name: "GLM-5.3 Flash" },
-  { id: "openpangu-2.0-flash", name: "openPangu 2.0 Flash" },
-  { id: "openpangu-2.0-pro", name: "openPangu 2.0 Pro" },
-  { id: "deepseek-v4-flash-0731", name: "DeepSeek V4 Flash" },
-  { id: "deepseek-v4-pro-0813", name: "DeepSeek V4 Pro" },
-  { id: "deepseek-v4.1-flash", name: "DeepSeek V4.1 Flash" },
+  { id: "glm-5.2-sft-harmony", name: "GLM-5.2-ArkTS-SPARK" },
+  { id: "openpangu-2.0-pro", name: "OpenPangu-2.0-Pro" },
+  { id: "openpangu-2.0-flash", name: "OpenPangu-2.0-Flash" },
+  { id: "glm-5.3", name: "GLM-5.3" },
+  { id: "deepseek-v4.1-flash", name: "DeepSeek-V4.1-Flash" },
+  { id: "kimi-k3", name: "Kimi-K3" },
+  { id: "deepseek-v4.1-flash-1017", name: "DeepSeek-V4.1-Flash-1017" },
 ]
 
 // ---- small helpers ---------------------------------------------------------
@@ -179,10 +159,10 @@ function prettify(id) {
     .join(" ")
 }
 
-// dropDateSuffix strips a trailing 4-digit version tag: deepseek-v4-flash-0731
-// -> deepseek-v4-flash. Only for the display name and the CONTEXT_WINDOWS
-// lookup. It must not rewrite ids sent to the backend: the dated form is the
-// registered free model and the bare form is a different, paid one.
+// dropDateSuffix strips a trailing 4-digit version tag: deepseek-v4.1-flash-1017
+// -> deepseek-v4.1-flash. Only for the CONTEXT_WINDOWS lookup. It must not
+// rewrite ids or names: the dated and bare forms are two separate models the
+// backend registers side by side, so the picker shows both under their own names.
 function normalizeModelId(id) {
   if (typeof id === "string" && id.length > 5) {
     const suffix = id.slice(-5)
@@ -282,8 +262,8 @@ function buildCanonicalRequest(method, uri, query, headers, payloadHash) {
 
 /**
  * Sign a Huawei request; returns the header map to merge into the request.
- * Extra headers (e.g. `maas_type: benefit`) participate in the canonical
- * request and must be sent verbatim, or the server rejects the signature.
+ * Extra headers participate in the canonical request and must be sent verbatim,
+ * or the server rejects the signature.
  */
 async function signRequestHuawei(ak, sk, securityToken, method, urlStr, body, extraHeaders, dateStampOverride) {
   const url = new URL(urlStr)
@@ -721,16 +701,6 @@ async function finalizeChatAnswer(res, foldToCompletion) {
   })
 }
 
-/** Is `model` one that needs the signed `maas_type: benefit` header? */
-function isBenefitModel(model) {
-  const id = String(model ?? "")
-  return benefitModelIds.includes(id) || BENEFIT_MODEL_FALLBACK.includes(id)
-}
-
-function rememberBenefitIds(ids) {
-  for (const id of ids) if (!benefitModelIds.includes(id)) benefitModelIds.push(id)
-}
-
 /**
  * The plugin's per-request fetch: sign the outgoing chat request with the
  * account's temporary credentials, then send it. Requests beyond the
@@ -749,7 +719,6 @@ async function signedFetch(cred, input, init, context) {
   // The body is part of the signature, so any rewrite happens before signing.
   const parsed = body.length > 0 ? safeJson(new TextDecoder().decode(body)) : null
   const model = parsed?.model
-  const extra = isBenefitModel(model) ? { maas_type: "benefit" } : undefined
   const foldToCompletion = needsStreamMetering(parsed)
   if (foldToCompletion) body = utf8(JSON.stringify({ ...parsed, stream: true }))
 
@@ -758,7 +727,7 @@ async function signedFetch(cred, input, init, context) {
   const signWith = async (c) => {
     const signed = await signRequestHuawei(
       c.access_key_id, c.secret_access_key, c.security_token,
-      method, url, body, extra,
+      method, url, body,
     )
     signed.forEach((value, key) => {
       if (key !== "host") headers.set(key, value)
@@ -1141,14 +1110,12 @@ async function queryQueueStatus(cred, model, context) {
 // ---- model list & account info ---------------------------------------------
 
 /**
- * One gateway/builtin entry into a model row. The id handed to magpie is the id
- * as published, never the date-stripped one: the free models are registered
- * only under their dated ids, so rewriting them breaks the call.
+ * One builtin entry into a model row. Id and name are handed to magpie exactly as
+ * published: the backend registers `deepseek-v4.1-flash` and its dated
+ * `deepseek-v4.1-flash-1017` side by side, so neither the id nor the label may be
+ * rewritten, or the picker would show one row twice.
  *
- * Dedupe is by exact id. A dated id and its bare form are two different models
- * on the backend with opposite billing (`deepseek-v4-flash-0731` draws on the
- * free token pool, the bare `deepseek-v4-flash` on credits), so collapsing them
- * would hide one of the two.
+ * Dedupe is by exact id.
  */
 function parseModelInfo(m, seen) {
   const rawId = m?.model_id
@@ -1160,8 +1127,7 @@ function parseModelInfo(m, seen) {
   if (seen.has(rawId)) return undefined
   seen.add(rawId)
   const rawName = m.model_name
-  const name = typeof rawName === "string" && rawName ? normalizeModelId(rawName) : prettify(base)
-  // gateway/config publishes per-model windows; prefer them over the static map.
+  const name = typeof rawName === "string" && rawName ? rawName.trim() : prettify(base)
   return {
     id: rawId,
     name,
@@ -1182,27 +1148,13 @@ function extractArray(text, path) {
 }
 
 /**
- * Fetch the account's live model list from the two signed endpoints and merge
- * them. Everything opengw gateway/config publishes is billed against the free
- * daily token pool, so each of its ids is recorded for the benefit header.
+ * Fetch the account's live model list. The builtin endpoint is the only source:
+ * the free-quota `gateway/config` feed was withdrawn, and this endpoint carries
+ * the ids, the display names and the per-model pricing the IDE shows.
  */
 async function fetchRemoteModels(cred, fetcher) {
   const models = []
   const seen = new Set()
-  const benefitIds = []
-
-  const gatewayText = await signedGet(OPENGW_GATEWAY_CONFIG_URL, cred, fetcher)
-  if (gatewayText !== undefined) {
-    const arr = extractArray(gatewayText, ["result", "models"])
-    for (const item of arr ?? []) {
-      if (typeof item !== "object" || item === null) continue
-      const mi = parseModelInfo(item, seen)
-      if (!mi) continue
-      mi.benefit = true
-      benefitIds.push(mi.id)
-      models.push(mi)
-    }
-  }
 
   const snapText = await signedGet(SNAP_MODEL_BUILTIN_URL, cred, fetcher, {
     "Content-Type": "application/json",
@@ -1218,7 +1170,6 @@ async function fetchRemoteModels(cred, fetcher) {
     }
   }
 
-  if (benefitIds.length > 0) rememberBenefitIds(benefitIds)
   return models
 }
 
@@ -1230,7 +1181,6 @@ const CREDIT_METRIC_LABELS = {
   usageBonusPackageCredit: "赠送积分包",
 }
 const TOTAL_CREDIT_METRIC = "usageTotalPackageCredit"
-const BENEFIT_WINDOW_LABEL = "免费额度"
 
 /** Compact credit counts for the display string (12345 → "1.2万"). */
 function formatCredit(n) {
@@ -1238,30 +1188,6 @@ function formatCredit(n) {
   if (v >= 1e8) return `${(v / 1e8).toFixed(1)}亿`
   if (v >= 1e4) return `${(v / 1e4).toFixed(1)}万`
   return String(Math.round(v))
-}
-
-/**
- * The benefit (free-quota) daily token allowance as a usage window. Its unit is
- * tokens, not credits: a `maas_type: benefit` chat is billed against this pool
- * and never touches the credit packages. `models` scopes it to the benefit ids
- * so it counts only the models that draw on it, and `aside` keeps it out of
- * routing: exhausting the free pool leaves the paid models usable.
- */
-function benefitWindow(raw, ids = []) {
-  const rec = asRecord(asRecord(raw).result ?? raw)
-  const limit = num(rec.daily_token_limit)
-  if (limit <= 0) return undefined
-  const used = Math.max(0, Math.min(num(rec.daily_tokens_used), limit))
-  return {
-    name: BENEFIT_WINDOW_LABEL,
-    used: clamp((used / limit) * 100),
-    display: `${formatCredit(used)} / ${formatCredit(limit)}`,
-    amount: used,
-    limit,
-    unit: "tokens",
-    aside: true,
-    ...(ids.length ? { models: [...ids].sort() } : {}),
-  }
 }
 
 /**
@@ -1286,7 +1212,7 @@ function creditWindow(name, limit, remain) {
 }
 
 /** Map the account's `statistics/plugin` answer to magpie's usage shape. */
-function usageFromStatistics(raw, benefitRaw, benefitIds = benefitModelIds) {
+function usageFromStatistics(raw) {
   let data = raw
   if (raw && typeof raw.code === "number") {
     if (raw.code !== 0) return { error: firstOf(raw.message, raw.msg, `CodeArts code ${raw.code}`), windows: [] }
@@ -1308,12 +1234,9 @@ function usageFromStatistics(raw, benefitRaw, benefitIds = benefitModelIds) {
     windows.push(creditWindow(name, limit, remain))
   }
 
-  // Keep the package total on top, then the per-bucket breakdown, then the
-  // separate free-quota pool.
+  // Keep the package total on top, then the per-bucket breakdown.
   const totalLabel = CREDIT_METRIC_LABELS[TOTAL_CREDIT_METRIC]
   windows.sort((a, b) => (a.name === totalLabel ? -1 : b.name === totalLabel ? 1 : 0))
-  const benefit = benefitWindow(benefitRaw, benefitIds)
-  if (benefit) windows.push(benefit)
 
   if (windows.length > 0) return { plan: plan || undefined, signIn: "kept", windows }
   return { plan: plan || undefined, windows, error: "该账号无积分额度" }
@@ -1340,9 +1263,6 @@ export const CodeArtsAuthPlugin = async ({ client } = {}, options = {}) => {
     name: m.name ?? m.id,
     limit: { context: m.context ?? 0, output: 0 },
     tool_call: true,
-    // magpie's own field: the model is served from the free daily token pool,
-    // not the plan's credits, so its picker row says 免费.
-    ...(isBenefitModel(m.id) ? { free: true } : {}),
   })
 
   const modelOf = (provider, live) => {
@@ -1352,9 +1272,6 @@ export const CodeArtsAuthPlugin = async ({ client } = {}, options = {}) => {
       id: live.id,
       name: live.name || base.name || live.id,
       limit: { context: live.context ?? base.limit?.context ?? 0, output: 0 },
-      // Same source of truth as the signed `maas_type: benefit` header, so a
-      // model never shows as free while being billed as paid, or the reverse.
-      ...(live.benefit === true || isBenefitModel(live.id) ? { free: true } : {}),
     }
   }
 
@@ -1471,10 +1388,7 @@ export const CodeArtsAuthPlugin = async ({ client } = {}, options = {}) => {
             "X-Language": "zh-cn",
           })
           if (text === undefined) return { error: "CodeArts answered an error", windows: [] }
-          // The free-quota panel is best-effort: a credit account with no
-          // benefit pool is normal, so its absence must not fail the whole read.
-          const benefitText = await signedGet(BENEFIT_BALANCE_URL, cred, fetcher)
-          return usageFromStatistics(safeJson(text), benefitText === undefined ? undefined : safeJson(benefitText))
+          return usageFromStatistics(safeJson(text))
         } catch (e) {
           return { error: e?.message ?? String(e), windows: [] }
         }
@@ -1536,8 +1450,8 @@ async function persistCredential(client, cred) {
 
 // for tests (never a plugin: magpie only calls exported functions)
 export const _internal = {
-  PROVIDER, NPM, CATALOG, CONTEXT_WINDOWS, BENEFIT_MODEL_FALLBACK,
-  CHAT_API_BASE, SNAP_MODEL_BUILTIN_URL, SNAP_STATISTICS_URL, OPENGW_GATEWAY_CONFIG_URL, BENEFIT_BALANCE_URL,
+  PROVIDER, NPM, CATALOG, CONTEXT_WINDOWS,
+  CHAT_API_BASE, SNAP_MODEL_BUILTIN_URL, SNAP_STATISTICS_URL,
   QUEUE_STATUS_URL, QUEUE_RETRY_DELAY_MS, QUEUE_MAX_ATTEMPTS, ACCOUNT_MAX_INFLIGHT,
   PORTAL_AUTHORIZE_BASE, STS_TOKEN_ENDPOINT, CLIENT_ID, REDIRECT_PATH,
   firstOf, asRecord, safeJson, num, clamp, prettify, normalizeModelId, formatCredit,
@@ -1548,12 +1462,12 @@ export const _internal = {
   requestToken, exchangeAuthorizationCode, exchangeRefreshToken, refreshCredential,
   buildOAuthLoginUrl, buildPortalLoginResultUrl, parseLegacyCredential, pollForCredential,
   startOAuthCallbackServer, listenOnCallbackPort, startOAuthFlow,
-  toBytes, isBenefitModel, rememberBenefitIds, signedFetch, signedGet,
+  toBytes, signedFetch, signedGet,
   createConcurrencyGate, delay, abortError, accountSessionIds,
   isQueueErrorResponse, isRetryableQueueCode, streamHeaders, rebuildResponse,
   sseErrorCode, isQuotaExhaustedCode, isExpiredCredentialResponse,
   isPermanentRefreshFailure, sseEventHasContent, classifySseHead, signInExpiredResponse,
-  needsStreamMetering, parseSseEvents, completionFromChunks, benefitWindow, creditWindow,
+  needsStreamMetering, parseSseEvents, completionFromChunks, creditWindow,
   peekSseQueueError, queueTerminalResponse, queryQueueStatus,
   parseModelInfo, extractArray, fetchRemoteModels, usageFromStatistics,
 }

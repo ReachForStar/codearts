@@ -101,15 +101,15 @@ test("signRequestHuawei signs a GET with the expected header set", async () => {
   )
 })
 
-test("signRequestHuawei includes content-type and maas_type in a signed POST", async () => {
+test("signRequestHuawei includes content-type and extra headers in a signed POST", async () => {
   const signed = await x.signRequestHuawei(
     "AK", "SK", "ST", "POST", "https://example.com/api/v2/chat/completions",
-    buf('{"model":"glm-5.3-flash"}'), { maas_type: "benefit" }, "20260101T000000Z",
+    buf('{"model":"GLM-5.2"}'), { "x-trace-id": "t1" }, "20260101T000000Z",
   )
   const auth = signed.get("Authorization")
-  assert.match(auth, /SignedHeaders=content-type;host;maas_type;x-sdk-content-sha256;x-sdk-date;x-security-token,/)
+  assert.match(auth, /SignedHeaders=content-type;host;x-sdk-content-sha256;x-sdk-date;x-security-token;x-trace-id,/)
   assert.equal(signed.get("content-type"), "application/json")
-  assert.equal(signed.get("maas_type"), "benefit")
+  assert.equal(signed.get("x-trace-id"), "t1")
 })
 
 test("signRequestHuawei is deterministic for a fixed date stamp", async () => {
@@ -127,27 +127,36 @@ test("normalizeModelId strips only a trailing 4-digit date", () => {
   assert.equal(x.normalizeModelId("GLM-5.2"), "GLM-5.2")
 })
 
-test("parseModelInfo keeps raw ids, drops vision models, dedupes, and fills context", () => {
+test("parseModelInfo keeps published ids and names, drops vision models, dedupes, and fills context", () => {
   const seen = new Set()
   assert.equal(x.parseModelInfo({ model_id: "Qwen3-VL-235B", model_name: "Qwen3-VL-235B" }, seen), undefined)
+  assert.equal(x.parseModelInfo({ model_id: "kimi-k2.6-vl", model_name: "Kimi-K2.6-VL" }, seen), undefined)
   const a = x.parseModelInfo({ model_id: "GLM-5.2", model_name: "GLM-5.2" }, seen)
   assert.equal(a.id, "GLM-5.2")
   assert.equal(a.name, "GLM-5.2")
   assert.equal(a.context, 202752)
   // Same id twice is one row.
   assert.equal(x.parseModelInfo({ model_id: "GLM-5.2", model_name: "GLM-5.2" }, seen), undefined)
-  // A dated id keeps its date: the dated and bare forms are two models.
-  const b = x.parseModelInfo({ model_id: "deepseek-v4-flash-0731", model_name: "deepseek-v4-flash-0731" }, seen)
-  assert.equal(b.id, "deepseek-v4-flash-0731")
-  assert.equal(b.name, "deepseek-v4-flash")
-  assert.equal(b.context, 1048576)
-  const c = x.parseModelInfo({ model_id: "deepseek-v4-flash", model_name: "deepseek-v4-flash" }, seen)
-  assert.equal(c.id, "deepseek-v4-flash")
+  // A dated id and its bare form are two models the backend registers side by
+  // side, so both keep their own id and label.
+  const b = x.parseModelInfo({ model_id: "deepseek-v4.1-flash-1017", model_name: "DeepSeek-V4.1-Flash-1017" }, seen)
+  assert.equal(b.id, "deepseek-v4.1-flash-1017")
+  assert.equal(b.name, "DeepSeek-V4.1-Flash-1017")
+  assert.equal(b.context, 1000000)
+  const c = x.parseModelInfo({ model_id: "deepseek-v4.1-flash", model_name: "DeepSeek-V4.1-Flash" }, seen)
+  assert.equal(c.id, "deepseek-v4.1-flash")
+  assert.equal(c.name, "DeepSeek-V4.1-Flash")
+  // The published label wins over a prettified id.
+  const d = x.parseModelInfo({ model_id: "glm-5.2-sft-harmony", model_name: "GLM-5.2-ArkTS-SPARK" }, seen)
+  assert.equal(d.name, "GLM-5.2-ArkTS-SPARK")
+  // No published name: fall back to a prettified id, date suffix dropped.
+  const e = x.parseModelInfo({ model_id: "glm-5.3" }, seen)
+  assert.equal(e.name, "Glm 5.3")
 })
 
-test("parseModelInfo prefers the published context window over the static map", () => {
+test("parseModelInfo prefers a published context window over the static map", () => {
   const seen = new Set()
-  const a = x.parseModelInfo({ model_id: "glm-5.3-flash", context_window: 131072, max_tokens: 8192 }, seen)
+  const a = x.parseModelInfo({ model_id: "glm-5.3", context_window: 131072, max_tokens: 8192 }, seen)
   assert.equal(a.context, 131072)
   assert.equal(a.output, 8192)
 })
@@ -197,7 +206,7 @@ test("usageFromStatistics maps credit metrics to windows with real numbers", () 
       { name: "usageBasicPackageCredit", package_credit_amount: 1000, package_credit_remain: 250, package_credit_used: 750 },
       { name: "usageOnDemandPackageCredit", package_credit_amount: 20000, package_credit_remain: 20000 },
     ],
-  }, { result: { daily_token_limit: 10000000, daily_tokens_used: 2500000 } }, ["glm-5.3-flash", "deepseek-v4.1-flash"])
+  })
   assert.equal(usage.plan, "企业版")
   assert.equal(usage.signIn, "kept")
   // The package total is listed first, then the buckets, all with display numbers.
@@ -205,7 +214,6 @@ test("usageFromStatistics maps credit metrics to windows with real numbers", () 
     { name: "总积分", used: 75, display: "750 / 1000", amount: 750, limit: 1000, unit: "credits" },
     { name: "基础积分包", used: 75, display: "750 / 1000", amount: 750, limit: 1000, unit: "credits", aside: true },
     { name: "按需积分包", used: 0, display: "0 / 2.0万", amount: 0, limit: 20000, unit: "credits", aside: true },
-    { name: "免费额度", used: 25, display: "250.0万 / 1000.0万", amount: 2500000, limit: 10000000, unit: "tokens", aside: true, models: ["deepseek-v4.1-flash", "glm-5.3-flash"] },
   ])
 })
 
@@ -214,25 +222,6 @@ test("only the package total window is left out of routing", () => {
   // total must never pause an account that still has credits elsewhere.
   assert.equal("aside" in x.creditWindow("总积分", 1000, 0), false)
   assert.equal(x.creditWindow("赠送积分包", 1000, 0).aside, true)
-  assert.equal(x.benefitWindow({ daily_token_limit: 10, daily_tokens_used: 10 }).aside, true)
-})
-
-test("usageFromStatistics omits the free-quota window without a benefit pool", () => {
-  const stats = {
-    metrics: [{ name: "usageTotalPackageCredit", package_credit_amount: 1000, package_credit_remain: 250, package_credit_used: 750 }],
-  }
-  assert.equal(x.usageFromStatistics(stats).windows.length, 1)
-  // A zero daily limit means the account has no benefit pool at all.
-  const noPool = { result: { daily_token_limit: 0, daily_tokens_used: 0 } }
-  assert.equal(x.usageFromStatistics(stats, noPool).windows.length, 1)
-})
-
-test("usageFromStatistics clamps a free-quota reading the endpoint over-reports", () => {
-  const w = x.benefitWindow({ result: { daily_token_limit: 100, daily_tokens_used: 400 } })
-  assert.deepEqual(
-    { used: w.used, amount: w.amount, unit: w.unit },
-    { used: 100, amount: 100, unit: "tokens" },
-  )
 })
 
 test("usageFromStatistics reports no credit plan when every bucket is empty", () => {
@@ -254,55 +243,41 @@ test("toBytes normalizes strings and views", async () => {
   assert.equal((await x.toBytes(null)).length, 0)
 })
 
-test("isBenefitModel honours the static fallback", () => {
-  assert.equal(x.isBenefitModel("glm-5.3-flash"), true)
-  assert.equal(x.isBenefitModel("GLM-5.2"), false)
-})
-
 // ---- remote model list -----------------------------------------------------
 
-const gatewayBody = JSON.stringify({
-  result: {
-    models: [
-      { model_id: "glm-5.3-flash", model_name: "glm-5.3-flash" },
-      { model_id: "deepseek-v4-flash-0731", model_name: "deepseek-v4-flash-0731" },
-      { model_id: "Qwen3-VL-235B", model_name: "Qwen3-VL-235B" },
-    ],
-  },
+const builtinBody = JSON.stringify({
+  builtinModels: [
+    { model_id: "GLM-5.2", model_name: "GLM-5.2" },
+    { model_id: "Qwen3-VL-235B", model_name: "Qwen3-VL-235B", supports_images: true },
+    { model_id: "kimi-k2.6-vl", model_name: "Kimi-K2.6-VL", supports_images: true },
+    { model_id: "deepseek-v4.1-flash", model_name: "DeepSeek-V4.1-Flash" },
+    { model_id: "deepseek-v4.1-flash-1017", model_name: "DeepSeek-V4.1-Flash-1017" },
+  ],
 })
-const builtinBody = JSON.stringify({ builtinModels: [{ model_id: "GLM-5.2", model_name: "GLM-5.2" }] })
 
 function modelsFetcher(seen) {
   return async (url, init) => {
     seen.push({ url: String(url), auth: new Headers(init?.headers).get("authorization") })
-    const body = String(url).includes("opengw") ? gatewayBody : builtinBody
-    return new Response(body, { status: 200 })
+    return new Response(builtinBody, { status: 200 })
   }
 }
 
-test("fetchRemoteModels merges both endpoints and keeps the published ids", async () => {
+test("fetchRemoteModels reads the builtin list and keeps the published ids and names", async () => {
   const seen = []
   const models = await x.fetchRemoteModels(
     { access_key_id: "AK", secret_access_key: "SK", security_token: "ST" },
     modelsFetcher(seen),
   )
-  const ids = models.map((m) => m.id)
-  assert.deepEqual(ids, ["glm-5.3-flash", "deepseek-v4-flash-0731", "GLM-5.2"])
-  assert.ok(seen.every((s) => String(s.auth).startsWith("SDK-HMAC-SHA256")))
-})
-
-test("fetchRemoteModels marks every gateway id as benefit, dated ones included", async () => {
-  const models = await x.fetchRemoteModels(
-    { access_key_id: "AK", secret_access_key: "SK", security_token: "ST" },
-    modelsFetcher([]),
-  )
-  const byId = Object.fromEntries(models.map((m) => [m.id, m]))
-  assert.equal(byId["glm-5.3-flash"].benefit, true)
-  assert.equal(byId["deepseek-v4-flash-0731"].benefit, true)
-  assert.equal("benefit" in byId["GLM-5.2"], false)
-  // The signature is what makes a gateway id callable at all, so the set the
-  // plugin signs with must be exactly the set it publishes.
-  for (const m of models) if (m.benefit) assert.equal(x.isBenefitModel(m.id), true, m.id)
+  assert.deepEqual(models.map((m) => m.id), [
+    "GLM-5.2", "deepseek-v4.1-flash", "deepseek-v4.1-flash-1017",
+  ])
+  assert.deepEqual(models.map((m) => m.name), [
+    "GLM-5.2", "DeepSeek-V4.1-Flash", "DeepSeek-V4.1-Flash-1017",
+  ])
+  // One signed GET, and no free-quota feed is consulted any more.
+  assert.equal(seen.length, 1)
+  assert.ok(String(seen[0].url).endsWith("/v1/model/builtin"))
+  assert.ok(String(seen[0].auth).startsWith("SDK-HMAC-SHA256"))
 })
 
 test("signedGet returns undefined on a non-2xx response", async () => {
@@ -370,7 +345,7 @@ test("loader signs each chat request with SDK-HMAC-SHA256", async () => {
   assert.equal(new TextDecoder().decode(seen[0].init.body), JSON.stringify({ model: "GLM-5.2", messages: [], stream: true }))
 })
 
-test("loader adds a signed maas_type header for benefit models", async () => {
+test("loader never adds a billing header any more", async () => {
   const cred = await makeCred()
   const seen = []
   const fetcher = async (url, init) => {
@@ -379,15 +354,18 @@ test("loader adds a signed maas_type header for benefit models", async () => {
   }
   const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: fetcher })
   const loaded = await plugin.auth.loader(async () => makeAuth(cred))
-  await loaded.fetch("https://snap-access.cn-north-4.myhuaweicloud.com/api/v2/chat/completions", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ model: "glm-5.3-flash" }),
-  })
-  const headers = new Headers(seen[0].headers)
-  assert.equal(headers.get("maas_type"), "benefit")
-  assert.match(headers.get("authorization"), /SignedHeaders=[^,]*,/)
-  assert.ok(headers.get("authorization").split("SignedHeaders=")[1].split(",")[0].includes("maas_type"))
+  for (const model of ["deepseek-v4.1-flash", "deepseek-v4.1-flash-1017", "GLM-5.2"]) {
+    await loaded.fetch("https://snap-access.cn-north-4.myhuaweicloud.com/api/v2/chat/completions", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model }),
+    })
+  }
+  for (const init of seen) {
+    const headers = new Headers(init.headers)
+    assert.equal(headers.has("maas_type"), false)
+    assert.ok(!headers.get("authorization").includes("maas_type"))
+  }
 })
 
 test("loader returns nothing when not signed in", async () => {
@@ -419,29 +397,31 @@ test("provider.models returns the account's live list", async () => {
   const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: modelsFetcher([]) })
   const provider = { models: { "GLM-5.2": { name: "GLM-5.2", limit: { context: 0, output: 0 } } } }
   const models = await plugin.provider.models(provider, { auth: makeAuth(cred) })
-  assert.deepEqual(Object.keys(models).sort(), ["GLM-5.2", "deepseek-v4-flash-0731", "glm-5.3-flash"])
+  assert.deepEqual(Object.keys(models).sort(), [
+    "GLM-5.2", "deepseek-v4.1-flash", "deepseek-v4.1-flash-1017",
+  ])
   assert.equal(models["GLM-5.2"].limit.context, 202752)
-  // Both gateway models show as free; the builtin one carries no free marking.
-  assert.equal(models["glm-5.3-flash"].free, true)
-  assert.equal(models["deepseek-v4-flash-0731"].free, true)
-  assert.equal("free" in models["GLM-5.2"], false)
+  assert.equal(models["deepseek-v4.1-flash-1017"].name, "DeepSeek-V4.1-Flash-1017")
+  assert.equal(models["deepseek-v4.1-flash-1017"].limit.context, 1000000)
+  // The billing status is the backend's: nothing is marked free any more.
+  for (const m of Object.values(models)) assert.equal("free" in m, false)
 })
 
-test("config offers the free models under the ids the benefit header accepts", async () => {
+test("config offers the models the builtin endpoint publishes today", async () => {
   const plugin = await CodeArtsAuthPlugin({ client: {} }, {})
   const config = {}
   await plugin.config(config)
   const m = config.provider.codearts.models
-  // Every published free id is one isBenefitModel signs for, so the picker row
-  // and the signed header can never disagree.
-  for (const id of ["glm-5.3-flash", "deepseek-v4.1-flash", "deepseek-v4-flash-0731", "deepseek-v4-pro-0813"]) {
-    assert.equal(m[id]?.free, true, id)
-    assert.equal(x.isBenefitModel(id), true, id)
+  assert.deepEqual(Object.keys(m).sort(), x.CATALOG.map((c) => c.id).sort())
+  // Both a dated id and its bare form are listed: the backend registers both.
+  assert.equal(m["deepseek-v4.1-flash"].name, "DeepSeek-V4.1-Flash")
+  assert.equal(m["deepseek-v4.1-flash-1017"].name, "DeepSeek-V4.1-Flash-1017")
+  assert.equal(m["glm-5.2-sft-harmony"].name, "GLM-5.2-ArkTS-SPARK")
+  // The withdrawn free ids and the unlisted GLM-5.1 are gone.
+  for (const id of ["glm-5.3-flash", "deepseek-v4-flash-0731", "deepseek-v4-pro-0813", "GLM-5.1"]) {
+    assert.equal(id in m, false, id)
   }
-  assert.equal("free" in m["GLM-5.2"], false)
-  // The paid models keep their bare ids; the dated ones are the free entries.
-  assert.equal("deepseek-v4-flash" in m, false)
-  assert.equal("deepseek-v4-pro" in m, false)
+  for (const model of Object.values(m)) assert.equal("free" in model, false)
 })
 
 test("provider.models falls back to the catalog when unsigned", async () => {

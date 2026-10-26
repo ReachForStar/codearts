@@ -3,12 +3,17 @@ title: CodeArts 免费模型 id 与计费池归属
 type: query
 tags: [CodeArts, benefit, 免费额度, 模型 id, 计费, 排查]
 created: 2026-10-16
-updated: 2026-10-16
+updated: 2026-10-26
 sources: []
-status: active
+status: superseded
 ---
 
 # CodeArts 免费模型 id 与计费池归属
+
+> **已被取代（2026-10-26）**：码道已下线免费额度体系，`gateway/config` 与
+> `user/tokens/balance` 均返回 `4000 invalid channel, group not found`，本页的 4 个
+> benefit 模型里 3 个已注销、1 个改为积分计费。现状与迁移见
+> [CodeArts 免费额度体系下线与计费口径迁移](codearts-benefit-retired.md)。
 
 ## 问题
 

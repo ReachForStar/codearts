@@ -27,7 +27,7 @@ SDK-HMAC-SHA256 签名，凭据由 OAuth 换取。因此本插件的 auth 与签
 | `generatePkcePair` / `generateDpopKeyPair` / `signDpopJws` / `requestToken` | `oauth.ts` | PKCE 与 DPoP（ES256）token 交换 |
 | `signRequestHuawei` / `buildCanonicalRequest` | `sign.ts` | 华为 SDK-HMAC-SHA256 请求签名 |
 | `fetchRemoteModels` / `parseModelInfo` / `normalizeModelId` | `models.ts` | 两个签名端点的模型列表 |
-| `signedFetch`（benefit 头、Chat-Id/Session-Id/lang） | `llm-adapter.ts` | Chat Completions 请求构造 |
+| `signedFetch`（Chat-Id/Session-Id/lang） | `llm-adapter.ts` | Chat Completions 请求构造 |
 | `usageFromStatistics` | `codearts-credits.ts` | 积分套餐用量 |
 
 辅助参考：`packages/cline`、`packages/zen-free`（用于确认 `loader` 返回值形态与
@@ -47,8 +47,7 @@ SDK-HMAC-SHA256 签名，凭据由 OAuth 换取。因此本插件的 auth 与签
 2. **请求签名：Bearer API Key → SDK-HMAC-SHA256**
    - `loader` 不再返回 `apiKey`，而是返回 `baseURL` + 自定义 `fetch`，在 `fetch` 内
      用 `signRequestHuawei` 给请求签名。
-   - benefit 模型附带**参与签名**的 `maas_type: benefit` 头；非 sign 的 `Chat-Id` /
-     `Session-Id` / `lang` 头在签名后追加。
+   - 非签名的 `Chat-Id` / `Session-Id` / `lang` 头在签名后追加。
    - 网关只对 SSE 流式回答做用量归集，非流式的 200 返回 token 却不扣分（实测：
      `stream: false` 后 `usageTotalPackageCredit.package_credit_used` 为 0，
      `stream: true` 精确入账）。因此签名前把对话请求体改写为 `stream: true`，
@@ -66,23 +65,17 @@ SDK-HMAC-SHA256 签名，凭据由 OAuth 换取。因此本插件的 auth 与签
 
 5. **模型目录与用量**
    - 目录换成码道真实模型，并带真实上下文窗口（见 README）。
-   - 实时列表来自 `opengw gateway/config`（benefit 模型）∪ `snap-access
-     /v1/model/builtin`（常规模型）；对 `-VL` 视觉模型过滤。
-   - **下发 id 不做去后缀改写**：`gateway/config` 公布的 4 个模型全部要带
-     `maas_type: benefit` 才能调用，而带日期后缀的 id 才是后端注册的形态。
-     实测：`deepseek-v4-flash-0731` 带 benefit 头 200，裸形 `deepseek-v4-flash`
-     带同一头报 `InferHub.4005.200 unsupported model`，不带则报
-     `InferHub.002002009.404`。两者是后端两个不同模型（计费口径相反），
-     按归一化 id 去重会让免费的那个从列表里消失。日期后缀只用于展示名与
-     `CONTEXT_WINDOWS` 查表。
-   - `usage` 读 `statistics/plugin` 的积分口径，并读 `opengw/v1/user/tokens/balance`
-     的 benefit 每日 token 额度，映射为 magpie 的 `{plan, windows}`。两条池互斥：
-     免费模型只扣 `daily_tokens_used`，不动积分。
-   - 免费模型在列表里带 magpie 专有字段 `free: true`（套餐免费提供、不占额度），
-     与 `maas_type: benefit` 头共用 `isBenefitModel` 这一判定来源，标注与计费不分叉。
+   - 实时列表只来自 `snap-access /v1/model/builtin`；对 `-VL` 视觉模型过滤。
+     模型 id、显示名、收费倍率都取自该接口，插件不硬编码任何模型名。
+   - **id 与名称不做去后缀改写**：后端同时注册 `deepseek-v4.1-flash` 与
+     `deepseek-v4.1-flash-1017`，费率也不同；按归一化 id 合并会让其中一个从列表里
+     消失。日期后缀只用于 `CONTEXT_WINDOWS` 查表。
+   - `usage` 只读 `statistics/plugin` 的积分口径，映射为 magpie 的 `{plan, windows}`。
+   - 免费额度体系（`maas_type: benefit` 头、`opengw gateway/config` 免费模型集、
+     `user/tokens/balance` 每日额度、`free: true` 标注、免费额度窗口）已于
+     2026-10-26 上游下线，相关代码全部移除，不再保留空壳分支。
    - 路由判定只看总积分：magpie 的额度上限取自用量窗口，所以下发的窗口里只有
-     「总积分」参与，其余窗口标 `aside: true`（用完不影响账号使用）；「免费额度」
-     窗口再用 `models` 限定为免费模型 id，免费池耗尽不阻断付费模型。
+     「总积分」参与，其余窗口标 `aside: true`（用完不影响账号使用）。
 
 6. **零依赖**
    - 签名与 PKCE/DPoP 全部用运行时内置 WebCrypto（`globalThis.crypto.subtle`）
@@ -95,12 +88,12 @@ SDK-HMAC-SHA256 签名，凭据由 OAuth 换取。因此本插件的 auth 与签
 2. `index.mjs` 导出插件函数 `CodeArtsAuthPlugin({ client }, options)`，返回
    `{ config, provider, auth }`：
    - `config`：用 `??=` 注册 `codearts` provider 与 `CATALOG` 模型，不覆盖用户配置。
-   - `provider.models`：签名拉取两个远端端点，失败回退目录。
+   - `provider.models`：签名拉取 builtin 模型端点，失败回退目录。
    - `auth`：`methods` 提供 OAuth 登录，`loader` 签名请求，`refresh` 续期，
      `usage` 汇报用量。
 3. `README.md` 写安装 / 登录 / 使用 / 已知限制。
 4. `index.test.mjs` 覆盖签名、PKCE/DPoP、凭据往返、远端列表、loader 签名、
-   续期、用量、回调服务器、流式计量与折叠、免费标注与路由口径，全程不联网
+   续期、用量、回调服务器、流式计量与折叠、收费口径与路由口径，全程不联网
    （`node --test`，55 项）。
 5. `registry-entry.json` 提供加入 `magpie` 插件市场的登记项。
 

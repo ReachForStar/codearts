@@ -3,7 +3,7 @@ title: CodeArts 非流式请求不计费与免费额度口径
 type: query
 tags: [CodeArts, 计费, 积分, 免费额度, SSE, 流式]
 created: 2026-10-16
-updated: 2026-10-16
+updated: 2026-10-26
 sources: []
 status: active
 ---
@@ -76,6 +76,10 @@ Chat Completions 都返回 HTTP 200 与真实 token 用量。
 ## 涉及模块
 
 > 免费标注与路由口径见 [CodeArts 用量窗口只让总积分参与路由](../decisions/codearts-usage-window-routing.md)。
+>
+> **2026-10-26 补注**：免费额度体系（`maas_type: benefit` 头、每日 token 免费额度、
+> 「免费额度」用量窗口）已被上游下线，本页关于免费池的口径成为历史记录。现状见
+> [免费额度体系下线与计费口径迁移](codearts-benefit-retired.md)。
 
 - `index.mjs`：`signedFetch`、`needsStreamMetering`、`parseSseEvents`、`completionFromChunks`、
   `finalizeChatAnswer`、`benefitWindow`、`usageFromStatistics`、`auth.usage`
