@@ -21,7 +21,7 @@ status: active
 | 文件 | 说明 |
 | --- | --- |
 | `index.mjs` | 全部实现：签名（`signRequestHuawei` / `buildCanonicalRequest`）、PKCE 与 DPoP（`generatePkcePair` / `generateDpopKeyPair` / `signDpopJws`）、本地回调服务器（`startOAuthCallbackServer` / `startOAuthFlow`）、凭据续期（`requestToken` / `refreshCredential`）、请求签名与排队（`signedFetch` / `queryQueueStatus` / `createConcurrencyGate`）、模型目录（`fetchRemoteModels`）、用量（`usageFromStatistics`） |
-| `index.test.mjs` | `node --test`，56 项，全部注入 `options.fetch`，不联网 |
+| `index.test.mjs` | `node --test`，62 项，全部注入 `options.fetch`，不联网 |
 | `README.md` | 安装、登录、使用、已知限制 |
 | `DESIGN.md` | 参考实现映射、改造说明、并发与会话设计 |
 | `registry-entry.json` | magpie 插件市场登记项 |
@@ -54,6 +54,14 @@ status: active
   [非流式请求不计费](../queries/codearts-nonstream-metering.md)。
 - 计费只有一个池：积分（`usageTotalPackageCredit` 等四个桶）。
   `auth.usage` 只映射积分口径，不再有 tokens 单位的窗口。
+- **每日签到**：`auth.checkin(getAuth)` 是 magpie 的钩子（OpenCode 忽略），按码道
+  「限时福利 → 每日领取」的同样三步调用：`GET v1/ops/delivery?channel=IDE` 找
+  `type === "USER_LOGIN"` 的活动 → `POST v1/ops/claim`（`{campaignId, channel: "IDE"}`）
+  → 返回带 `id` 时 `POST v1/ops/confirm`（`{campaignId}`）。结果
+  `claimed` / `done` / `inactive` / `ineligible` / `failed`；`claimable: false` 且
+  `status` 属于 `CLAIMED`/`CONFIRMED`/`CONSUMED` 视为今天已领取。领取被拒时重读活动
+  列表，若别处刚领过按 `done` 处理。通用签名请求走 `snapRequest`（`{code, message,
+  data}` 形态，`code !== 0` 即拒绝），路由头 `Agent-Type` / `X-Language` 不参与签名。
 - **路由只看「总积分」窗口**：其余三个积分桶标 `aside: true`（用完不影响账号使用）。
   依据与实测见
   [用量窗口只让总积分参与路由](../decisions/codearts-usage-window-routing.md)。
@@ -84,3 +92,7 @@ status: active
   端点，模型列表只读 `v1/model/builtin`，显示名不再去日期后缀，出厂目录换成当前
   8 个模型；测试 56 项。详见
   [免费额度体系下线与计费口径迁移](../queries/codearts-benefit-retired.md)。
+- 2026-10-26：实现 magpie 的 `auth.checkin` 每日签到（`v1/ops/delivery` → `ops/claim`
+  → `ops/confirm`），回 `claimed`/`done`/`inactive`/`ineligible`/`failed`；测试 62 项。
+  接口契约与实测见
+  [每日签到接口与领取状态](../queries/codearts-daily-checkin.md)。

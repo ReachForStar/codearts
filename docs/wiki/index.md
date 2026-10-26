@@ -28,4 +28,5 @@ updated: 2026-10-26
 - [CodeArts 非流式请求不计费与免费额度口径](queries/codearts-nonstream-metering.md) — 网关只对 SSE 流式请求做用量归集（免费池部分已成历史记录）
 - [CodeArts 免费模型 id 与计费池归属](queries/codearts-benefit-model-ids.md) — 已被取代：2026-10-26 免费额度体系下线
 - [CodeArts 免费额度体系下线与计费口径迁移](queries/codearts-benefit-retired.md) — `gateway/config` / `tokens/balance` 返回 4000；旧 4 个 benefit id 全部失效；模型列表与名称改由 `v1/model/builtin` 自动获取
+- [CodeArts 每日签到接口与领取状态](queries/codearts-daily-checkin.md) — `v1/ops/delivery` → `ops/claim` → `ops/confirm` 三步、已领取判定与拒绝返回
 - [CodeArts 软失败不触发故障切换与状态码换算](queries/codearts-soft-failure-failover.md) — magpie 只在非 2xx 时切换账户；额度用尽 429、其他终态 SSE 错误 502、凭据过期刷新后重发、刷新令牌失效 401 标记账号

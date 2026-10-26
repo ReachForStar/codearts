@@ -4,7 +4,7 @@
 [![magpie plugin](https://img.shields.io/badge/magpie-plugin-8A2BE2)](https://usemagpie.ai/docs/zh/plugins)
 [![OpenCode plugin](https://img.shields.io/badge/OpenCode-plugin-blue)](https://opencode.ai)
 ![no dependencies](https://img.shields.io/badge/dependencies-none-brightgreen)
-![tests](https://img.shields.io/badge/tests-56%20passing-success)
+![tests](https://img.shields.io/badge/tests-62%20passing-success)
 
 [Huawei Cloud CodeArts (华为云码道 代码智能体)](https://www.huaweicloud.com/product/codearts.html)  
 作为 magpie / OpenCode 的 provider 插件：用**华为云 OAuth 授权登录**接入码道的模型  
@@ -53,6 +53,10 @@ magpie plugin add ./index.mjs
     未登录时用同样这 8 个的出厂目录。模型 id、显示名与收费倍率全部取自
     `v1/model/builtin`，插件不硬编码任何模型名或免费标记。
 -   CLI 里可用 `codearts --model codearts/GLM-5.2` 之类方式指定。
+-   **每日签到**：插件实现 magpie 的 `auth.checkin`，按码道「限时福利 → 每日领取」
+    的顺序调用 `v1/ops/delivery` → `v1/ops/claim` → `v1/ops/confirm`，每天领取一次。
+    结果回 `claimed`（带积分）、`done`（今天已领取）、`inactive`（当前没有活动）、
+    `ineligible`（不可领取）、`failed`（附原因）。OpenCode 不调用该钩子。
 
 ## 说明与已知限制
 
@@ -126,6 +130,10 @@ prices all read from `v1/model/builtin`.
 ### Notes
 
 - Region/endpoint is fixed to Huawei Cloud `cn-north-4`.
+- Daily check-in: the plugin implements magpie's `auth.checkin` hook with the same
+  three calls the IDE's 「限时福利 → 每日领取」 makes (`v1/ops/delivery` → `ops/claim` →
+  `ops/confirm`), once per day. It answers `claimed` (with the credit amount), `done`,
+  `inactive`, `ineligible` or `failed`. OpenCode ignores the hook.
 - The free-quota (`benefit`) tier was withdrawn on 2026-10-26: its `gateway/config`
   and `user/tokens/balance` feeds answer `4000 invalid channel`, and the old
   `maas_type: benefit` header is rejected with `InferHub.4004.200 benefit not found`.

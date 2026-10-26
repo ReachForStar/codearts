@@ -447,6 +447,118 @@ test("auth.usage reports the plan's credit window", async () => {
   ])
 })
 
+// ---- daily check-in ---------------------------------------------------------
+
+/** A stand-in for the three ops endpoints: `state.item` is the USER_LOGIN entry. */
+function opsFetcher(state, { claim, confirm } = {}) {
+  const calls = []
+  const ok = (data) => new Response(JSON.stringify({ code: 0, message: "ok", data }), { status: 200 })
+  const fetcher = async (url, init) => {
+    const u = String(url)
+    const headers = new Headers(init.headers)
+    const body = init.body ? JSON.parse(new TextDecoder().decode(init.body)) : undefined
+    calls.push({ url: u, method: init.method, body, headers })
+    if (u === x.OPS_DELIVERY_URL) {
+      const items = [{ campaignId: 7, type: "INVITE_USER", claimable: false }]
+      if (state.item) items.push(state.item)
+      if (state.listStatus) {
+        return new Response('{"error_code":"APIG.0301","error_msg":"verify ak sk signature fail"}', { status: state.listStatus })
+      }
+      return ok({ items })
+    }
+    if (u === x.OPS_CLAIM_URL) {
+      if (claim) return claim(state)
+      state.item = { ...state.item, claimable: false, status: "CLAIMED" }
+      return ok({ id: 42, benefitAmount: 1000 })
+    }
+    if (u === x.OPS_CONFIRM_URL) {
+      if (confirm) return confirm(state)
+      state.item = { ...state.item, status: "CONFIRMED" }
+      return ok(null)
+    }
+    throw new Error(`unexpected ${u}`)
+  }
+  return { fetcher, calls }
+}
+
+const daily = (extra) => ({ campaignId: 1, type: "USER_LOGIN", title: "每日领取", claimable: true, status: "ENTRY", benefitAmount: 1000, ...extra })
+
+test("checkin claims and confirms the daily benefit the way the IDE does", async () => {
+  const cred = await makeCred()
+  const { fetcher, calls } = opsFetcher({ item: daily() })
+  const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: fetcher })
+  const r = await plugin.auth.checkin(async () => makeAuth(cred))
+  assert.deepEqual(r, { outcome: "claimed", credit: 1000, message: "+1000 积分" })
+  assert.deepEqual(calls.map((c) => [c.method, c.url]), [
+    ["GET", x.OPS_DELIVERY_URL],
+    ["POST", x.OPS_CLAIM_URL],
+    ["POST", x.OPS_CONFIRM_URL],
+  ])
+  assert.deepEqual(calls[1].body, { campaignId: 1, channel: "IDE" })
+  assert.deepEqual(calls[2].body, { campaignId: 1 })
+  for (const c of calls) {
+    const auth = c.headers.get("authorization")
+    assert.match(auth, /^SDK-HMAC-SHA256 Access=AK,/)
+    // Routing headers go along unsigned: signing them breaks the signature.
+    assert.equal(c.headers.get("agent-type"), "PromptCenter")
+    assert.equal(auth.split("SignedHeaders=")[1].split(",")[0].includes("agent-type"), false)
+  }
+  // Asked again the same day: in already, and nothing is claimed twice.
+  const again = await plugin.auth.checkin(async () => makeAuth(cred))
+  assert.equal(again.outcome, "done")
+  assert.equal(calls.filter((c) => c.url === x.OPS_CLAIM_URL).length, 1)
+})
+
+test("checkin skips the confirm when the claim answers no id", async () => {
+  const cred = await makeCred()
+  const ok = (data) => new Response(JSON.stringify({ code: 0, data }), { status: 200 })
+  const { fetcher, calls } = opsFetcher({ item: daily() }, { claim: () => ok({ id: null }) })
+  const r = await x.dailyCheckin(cred, fetcher)
+  assert.deepEqual(r, { outcome: "claimed", credit: 1000, message: "+1000 积分" })
+  assert.equal(calls.some((c) => c.url === x.OPS_CONFIRM_URL), false)
+})
+
+test("checkin tells done, inactive and ineligible apart", async () => {
+  const cred = await makeCred()
+  for (const status of ["CLAIMED", "CONFIRMED", "CONSUMED"]) {
+    const { fetcher, calls } = opsFetcher({ item: daily({ claimable: false, status }) })
+    assert.equal((await x.dailyCheckin(cred, fetcher)).outcome, "done")
+    assert.equal(calls.length, 1)
+  }
+  assert.equal((await x.dailyCheckin(cred, opsFetcher({}).fetcher)).outcome, "inactive")
+  const ineligible = await x.dailyCheckin(cred, opsFetcher({ item: daily({ claimable: false, status: null }) }).fetcher)
+  assert.equal(ineligible.outcome, "ineligible")
+})
+
+test("checkin looks again after a refused claim, and reports a real failure", async () => {
+  const cred = await makeCred()
+  const refused = (s) => {
+    s.item = { ...s.item, claimable: false, status: "CLAIMED" } // claimed elsewhere meanwhile
+    return new Response(JSON.stringify({ code: 1001, message: "already claimed" }), { status: 200 })
+  }
+  assert.equal((await x.dailyCheckin(cred, opsFetcher({ item: daily() }, { claim: refused }).fetcher)).outcome, "done")
+
+  const boom = () => new Response(JSON.stringify({ code: 500, message: "活动太火爆" }), { status: 200 })
+  const failed = await x.dailyCheckin(cred, opsFetcher({ item: daily() }, { claim: boom }).fetcher)
+  assert.deepEqual(failed, { outcome: "failed", message: "领取失败：活动太火爆" })
+
+  const listFailed = await x.dailyCheckin(cred, opsFetcher({ item: daily(), listStatus: 401 }).fetcher)
+  assert.equal(listFailed.outcome, "failed")
+  assert.match(listFailed.message, /HTTP 401: APIG\.0301/)
+})
+
+test("checkin fails on a refused confirmation", async () => {
+  const cred = await makeCred()
+  const confirm = () => new Response(JSON.stringify({ code: 500, message: "确认失败" }), { status: 200 })
+  const r = await x.dailyCheckin(cred, opsFetcher({ item: daily() }, { confirm }).fetcher)
+  assert.deepEqual(r, { outcome: "failed", message: "领取确认失败：确认失败" })
+})
+
+test("checkin without a sign-in fails without calling the vendor", async () => {
+  const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: async () => { throw new Error("no network") } })
+  assert.deepEqual(await plugin.auth.checkin(async () => ({ type: "api", key: "k" })), { outcome: "failed", message: "not signed in" })
+})
+
 // ---- OAuth callback server -------------------------------------------------
 
 test("startOAuthFlow serves a callback server and a valid login URL", async () => {

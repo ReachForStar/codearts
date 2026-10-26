@@ -49,6 +49,16 @@ const SNAP_HOST = "https://snap-access.cn-north-4.myhuaweicloud.com"
 const SNAP_MODEL_BUILTIN_URL = `${SNAP_HOST}/v1/model/builtin`
 const SNAP_STATISTICS_URL = `${SNAP_HOST}/snap-manager/v1/statistics/plugin`
 const CREDENTIAL_ENDPOINT = `${SNAP_HOST}/snap-manager/v1/login/ticket`
+// Daily check-in (「限时福利 → 每日领取」), the same three calls the IDE makes.
+const OPS_DELIVERY_URL = `${SNAP_HOST}/v1/ops/delivery?channel=IDE`
+const OPS_CLAIM_URL = `${SNAP_HOST}/v1/ops/claim`
+const OPS_CONFIRM_URL = `${SNAP_HOST}/v1/ops/confirm`
+const OPS_CHANNEL = "IDE"
+const DAILY_CHECKIN_TYPE = "USER_LOGIN"
+// States in which today's benefit is already in.
+const CLAIMED_STATUSES = ["CLAIMED", "CONFIRMED", "CONSUMED"]
+// Unsigned headers snap-access routes on; signing them breaks the signature.
+const SNAP_EXTRA_HEADERS = { "Agent-Type": "PromptCenter", "X-Language": "zh-cn" }
 // OAuth portal (new IAM flow) and the STS token endpoint.
 const PORTAL_AUTHORIZE_BASE = "https://codearts.huaweicloud.com/portal/authorize"
 const PORTAL_LOGIN_BASE = "https://codearts.huaweicloud.com/portal/login"
@@ -832,6 +842,100 @@ async function signedGet(url, cred, fetcher, extraUnsignedHeaders) {
   }
 }
 
+// ---- daily check-in ---------------------------------------------------------
+
+/** A vendor failure as one line: `HTTP 401: APIG.0301 verify ak sk signature fail`. */
+function describeHttpFailure(status, text) {
+  const raw = safeJson(text)
+  const detail = raw
+    ? [firstOf(raw.error_code, String(raw.code ?? "")), firstOf(raw.error_msg, raw.message, raw.msg)].filter(Boolean).join(" ")
+    : String(text ?? "").trim().slice(0, 200)
+  return detail ? `HTTP ${status}: ${detail}` : `HTTP ${status}`
+}
+
+/**
+ * A signed snap-access call in the `{ code, message, data }` shape the ops
+ * endpoints answer, `code !== 0` being a refusal. Gives `{ ok: true, data }` or
+ * `{ ok: false, message }`, never throws: a check-in either works or reports why.
+ */
+async function snapRequest(method, url, cred, fetcher, payload) {
+  const body = payload === undefined ? new Uint8Array() : utf8(JSON.stringify(payload))
+  let res
+  let text
+  try {
+    const signed = await signRequestHuawei(
+      cred.access_key_id, cred.secret_access_key, cred.security_token,
+      method, url, body,
+    )
+    const headers = new Headers()
+    signed.forEach((value, key) => {
+      if (key !== "host") headers.set(key, value)
+    })
+    for (const [k, v] of Object.entries(SNAP_EXTRA_HEADERS)) headers.set(k, v)
+    res = await fetcher(url, {
+      method,
+      headers,
+      ...(payload === undefined ? {} : { body }),
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    })
+    text = await res.text()
+  } catch (e) {
+    return { ok: false, message: e?.message ?? String(e) }
+  }
+  if (!res.ok) return { ok: false, message: describeHttpFailure(res.status, text) }
+  const raw = safeJson(text)
+  if (!raw || Array.isArray(raw)) return { ok: false, message: "the answer could not be read" }
+  if (raw.code !== undefined && Number(raw.code) !== 0) {
+    return { ok: false, message: firstOf(raw.message, raw.msg, `code ${raw.code}`) }
+  }
+  return { ok: true, data: "data" in raw ? raw.data : raw }
+}
+
+/** The account's 「每日领取」 campaign from the activity list, or why it can't be read. */
+async function dailyCampaign(cred, fetcher) {
+  const listed = await snapRequest("GET", OPS_DELIVERY_URL, cred, fetcher)
+  if (!listed.ok) return { error: `活动列表读取失败：${listed.message}` }
+  const items = asRecord(listed.data).items
+  if (!Array.isArray(items)) return { error: "活动列表缺少 items" }
+  return { item: items.find((it) => asRecord(it).type === DAILY_CHECKIN_TYPE) }
+}
+
+const isClaimedToday = (item) => !item?.claimable && CLAIMED_STATUSES.includes(item?.status)
+
+/**
+ * Press the daily check-in the way the IDE's 「限时福利 → 每日领取」 does: list the
+ * activities, claim the `USER_LOGIN` one, and confirm it when the claim answers
+ * an id, or the credits stay pending. Answers magpie's check-in outcome
+ * (`claimed` / `done` / `inactive` / `ineligible` / `failed`) and never throws.
+ */
+async function dailyCheckin(cred, fetcher) {
+  const first = await dailyCampaign(cred, fetcher)
+  if (first.error) return { outcome: "failed", message: first.error }
+  const item = first.item
+  if (!item) return { outcome: "inactive", message: "当前没有每日领取活动" }
+  const listed = num(item.benefitAmount)
+  if (isClaimedToday(item)) return { outcome: "done", message: "今天已领取" }
+  if (!item.claimable) return { outcome: "ineligible", message: `当前不可领取（status=${item.status ?? "null"}）` }
+  if (item.campaignId === undefined || item.campaignId === null || item.campaignId === "") {
+    return { outcome: "failed", message: "活动缺少 campaignId" }
+  }
+
+  const claimed = await snapRequest("POST", OPS_CLAIM_URL, cred, fetcher, { campaignId: item.campaignId, channel: OPS_CHANNEL })
+  if (!claimed.ok) {
+    // Claimed elsewhere a moment ago (the IDE, another host): look again.
+    const again = await dailyCampaign(cred, fetcher)
+    if (isClaimedToday(again.item)) return { outcome: "done", message: "今天已领取" }
+    return { outcome: "failed", message: `领取失败：${claimed.message}` }
+  }
+  const benefit = asRecord(claimed.data)
+  if (claimed.data && benefit.id !== null) {
+    const confirmed = await snapRequest("POST", OPS_CONFIRM_URL, cred, fetcher, { campaignId: item.campaignId })
+    if (!confirmed.ok) return { outcome: "failed", message: `领取确认失败：${confirmed.message}` }
+  }
+  const got = num(benefit.benefitAmount) || listed
+  return { outcome: "claimed", ...(got > 0 ? { credit: got } : {}), message: got > 0 ? `+${got} 积分` : "已领取" }
+}
+
 // ---- upstream concurrency & queueing ---------------------------------------
 
 /**
@@ -1394,6 +1498,14 @@ export const CodeArtsAuthPlugin = async ({ client } = {}, options = {}) => {
         }
       },
 
+      // magpie's own hook: the daily 「每日领取」 check-in (OpenCode ignores it).
+      // magpie renews the sign-in before asking and asks once a Beijing day.
+      async checkin(getAuth) {
+        const cred = credentialOf(await getAuth())
+        if (!cred?.access_key_id) return { outcome: "failed", message: "not signed in" }
+        return dailyCheckin(cred, fetcher)
+      },
+
       methods: [
         {
           type: "oauth",
@@ -1452,6 +1564,8 @@ async function persistCredential(client, cred) {
 export const _internal = {
   PROVIDER, NPM, CATALOG, CONTEXT_WINDOWS,
   CHAT_API_BASE, SNAP_MODEL_BUILTIN_URL, SNAP_STATISTICS_URL,
+  OPS_DELIVERY_URL, OPS_CLAIM_URL, OPS_CONFIRM_URL, OPS_CHANNEL,
+  DAILY_CHECKIN_TYPE, CLAIMED_STATUSES, SNAP_EXTRA_HEADERS,
   QUEUE_STATUS_URL, QUEUE_RETRY_DELAY_MS, QUEUE_MAX_ATTEMPTS, ACCOUNT_MAX_INFLIGHT,
   PORTAL_AUTHORIZE_BASE, STS_TOKEN_ENDPOINT, CLIENT_ID, REDIRECT_PATH,
   firstOf, asRecord, safeJson, num, clamp, prettify, normalizeModelId, formatCredit,
@@ -1462,7 +1576,8 @@ export const _internal = {
   requestToken, exchangeAuthorizationCode, exchangeRefreshToken, refreshCredential,
   buildOAuthLoginUrl, buildPortalLoginResultUrl, parseLegacyCredential, pollForCredential,
   startOAuthCallbackServer, listenOnCallbackPort, startOAuthFlow,
-  toBytes, signedFetch, signedGet,
+  toBytes, signedFetch, signedGet, snapRequest, describeHttpFailure,
+  dailyCampaign, isClaimedToday, dailyCheckin,
   createConcurrencyGate, delay, abortError, accountSessionIds,
   isQueueErrorResponse, isRetryableQueueCode, streamHeaders, rebuildResponse,
   sseErrorCode, isQuotaExhaustedCode, isExpiredCredentialResponse,

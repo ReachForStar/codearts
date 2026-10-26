@@ -34,3 +34,7 @@
 ## [2026-10-26] fix | 删除 benefit 头、free 标注、免费额度窗口与两个失效端点；模型列表只读 v1/model/builtin，显示名不再去日期后缀，出厂目录换成当前 8 个模型（0.1.7）
 
 ## [2026-10-26] query | 沉淀收费口径迁移：IDE 内置列表与 builtin 接口逐项核对、倍率与错峰时段、复发预防
+
+## [2026-10-26] feat | 实现 magpie 的 auth.checkin 每日签到：ops/delivery 找 USER_LOGIN → claim → confirm，回 claimed/done/inactive/ineligible/failed（0.1.8）
+
+## [2026-10-26] query | 沉淀签到接口契约与实测：已领取判定（claimable=false + CONFIRMED）、claim 被拒文案、路由头不参与签名
